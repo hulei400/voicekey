@@ -7,6 +7,7 @@ class App : Application() {
         super.onCreate()
         app = this
         Native.init(filesDir.absolutePath)
+        Watchdog.schedule(this)
     }
 
     companion object {
