@@ -34,6 +34,9 @@ class VoiceService : AccessibilityService() {
     private var chord = Chord(chordKeys)
     /** 1.13.4 悬浮栏自动触发：自动会话结束后抑制再触发，直到框失焦或悬浮栏关掉再重新聚焦 */
     private var overlayAutoSuppressed = false
+    /** 1.13.18 触发决策文件日志节流：悬浮栏在前台时的状态行每秒最多记一次
+     *（check 每 150ms 跑一次，不节流会把文件写爆）。触发那一下不节流。 */
+    private var lastTrigLogMs = 0L
     /**
      * 1.13.5 前台 Activity 跟踪：TYPE_WINDOW_STATE_CHANGED 事件更新，认悬浮栏用。
      * 只记类名含 "Activity" 的窗口（输入法窗口等非 Activity 窗口不覆盖），避免键盘弹出时
@@ -214,8 +217,19 @@ class VoiceService : AccessibilityService() {
         if (e.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             val cls = e.className?.toString()
             if (cls != null && cls.contains("Activity")) {
+                // 1.13.18 悬浮栏关/开时清抑制：17:24:48 和 17:36:37 两次“没触发”
+                // 最可能的共同根因是抑制从上次会话残留下来（17:25:41 那次关掉
+                // 时置的），没在悬浮栏关闭/重开时解除。按前台 Activity 的变迁清：
+                // 从悬浮栏切到别的 Activity（栏关了）或从别的 Activity 切回
+                // 悬浮栏（新实例启动了）都清；同一个悬浮栏实例内不重复清（抑制
+                // 本来就是防会话结束后在同一个栏里重复触发的）。只记 Activity
+                // 类名的窗口切换（输入法窗口等不覆盖），键盘弹出不影响。
+                val wasOverlay = foregroundActivity?.contains(OVERLAY_ACTIVITY) == true
+                val isOverlay = cls.contains(OVERLAY_ACTIVITY)
                 foregroundActivityPkg = e.packageName?.toString()
                 foregroundActivity = cls
+                if (isOverlay && !wasOverlay) clearSuppression("new-overlay-instance")
+                if (!isOverlay && wasOverlay) clearSuppression("overlay-closed")
             }
         }
         main.removeCallbacks(check)
@@ -533,7 +547,7 @@ class VoiceService : AccessibilityService() {
         if (!::session.isInitialized) return
         val pkg = e.packageName?.toString() ?: rootInActiveWindow?.packageName?.toString()
         if (pkg != MUSE_PKG) {
-            if (e.packageName != null) overlayAutoSuppressed = false
+            if (e.packageName != null) clearSuppression("other-package")
             return
         }
         val input = focusedInput()
@@ -544,20 +558,82 @@ class VoiceService : AccessibilityService() {
         if (session.active || session.recording) return
         if (input == null) {
             // 失焦 / 悬浮栏关掉：解除抑制，等下次重新聚焦
-            overlayAutoSuppressed = false
+            clearSuppression("focus-lost")
             return
         }
+        // 1.13.18：框就是悬浮栏搜索框时，把这次评估也记进文件日志（节流 1 秒），
+        // 下次“没触发”能直接看到是哪个条件拦住了（Log.d 读不到）。
+        val blockReason = when {
+            overlayAutoSuppressed -> "blocked suppressed=true"
+            action == EditorInfo.IME_ACTION_SEND -> "blocked ime-send"
+            !nodeTextEmpty(input) -> "blocked text-not-empty"
+            !matched -> "blocked not-matched"
+            else -> "trigger"
+        }
+        if (matched) logTriggerState("TRIG", input, true, blockReason)
         if (overlayAutoSuppressed) return
         // 明确限制：聊天输入框（IME 动作 SEND）永不自动触发（Activity 已把聊天排除，这是第二道）
         if (action == EditorInfo.IME_ACTION_SEND) return
         if (!nodeTextEmpty(input)) return
         if (!matched) return
+        logTrigger("TRIG", "trigger activity=$foregroundActivity")
         session.autoStartOverlay()
+    }
+
+    /** 1.13.18 触发决策文件日志：写进 vk-session-trace.log（和 Session 的
+     * BEGIN/END 同一个文件），前缀 [POLL]/[TRIG]/[SUPP]，和会话行区分开。
+     * 1.13.17 的教训：轮询决策只记 Log.d（读不到），17:36:37 聚焦了 16 秒
+     * 都没触发，文件里没有任何痕迹。下次再报“没触发”直接读这个文件就能
+     * 钉死是哪个条件拦住了。 */
+    private fun logTrigger(tag: String, msg: String) {
+        try {
+            val f = java.io.File(filesDir, "vk-session-trace.log")
+            if (f.exists() && f.length() > 512 * 1024) f.delete()
+            val wall = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US).format(java.util.Date(System.currentTimeMillis()))
+            f.appendText("$wall [$tag] $msg\n")
+        } catch (_: Exception) {
+        }
+    }
+
+    /** 1.13.18 触发决策状态行（节流 1 秒）：悬浮栏在前台时写清当时每个条件
+     * 的值 + 拦住触发的理由（或 trigger）。只在悬浮栏在前台时记，别的
+     * App 里不记。 */
+    private fun logTriggerState(source: String, input: AccessibilityNodeInfo?, matched: Boolean, blockReason: String) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastTrigLogMs < 1000L) return
+        lastTrigLogMs = now
+        val inputDesc = try {
+            if (input == null) "null" else {
+                val b = Rect()
+                input.getBoundsInScreen(b)
+                "${input.className} bounds=$b editable=${input.isEditable}"
+            }
+        } catch (_: Exception) {
+            "?"
+        }
+        val textEmpty = try { input?.let { nodeTextEmpty(it) } } catch (_: Exception) { "?" }
+        val active = if (::session.isInitialized) session.active.toString() else "?"
+        val recording = if (::session.isInitialized) session.recording.toString() else "?"
+        logTrigger(source, "activity=$foregroundActivity pkg=$foregroundActivityPkg input=$inputDesc matched=$matched textEmpty=$textEmpty suppressed=$overlayAutoSuppressed switch=${App.prefs.museOverlayInsert} active=$active recording=$recording $blockReason")
     }
 
     /** 自动触发的会话结束（上屏/失败/超时）后抑制再触发，直到框失焦或悬浮栏关掉 */
     fun suppressOverlayAuto() {
-        overlayAutoSuppressed = true
+        if (!overlayAutoSuppressed) {
+            overlayAutoSuppressed = true
+            // 1.13.18：置抑制记文件日志（和轮询时标志值对照，看抑制是不是残留的）
+            logTrigger("SUPP", "set suppressed=true (session closed)")
+        }
+    }
+
+    /** 1.13.18 清抑制（只在真的置着时动作+记日志）：悬浮栏关掉、新悬浮栏实例
+     * 启动、框失焦、切到别的 App 时调。只在悬浮栏真的关掉或新实例启动时清，
+     * 别在同一个悬浮栏实例内清掉，否则同一个悬浮栏里会话结束后会重复触发。 */
+    private fun clearSuppression(reason: String) {
+        if (overlayAutoSuppressed) {
+            overlayAutoSuppressed = false
+            logTrigger("SUPP", "clear reason=$reason")
+        }
     }
 
     /**
@@ -571,15 +647,16 @@ class VoiceService : AccessibilityService() {
      * 任何无障碍事件（内容变化、滚动等）150ms 后的轮询也能补上。
      * 触发后同样走 suppressOverlayAuto() 的抑制逻辑（Session.close 里调），
      * 避免重复触发；抑制的解除条件（失焦/栏关）不动。
-     * 只记 Log.d（check 每 150ms 跑一次，写文件太吵；触发那一下由
-     * Session 的 BEGIN/AUTO 行记）。
+     * 1.13.18：轮询决策改记文件日志（[POLL] 行，节流 1 秒）——1.13.17 只记
+     * Log.d，17:36:37 聚焦了 16 秒都没触发，文件里没有任何痕迹，定不了因。
+     * 悬浮栏不在前台时清抑制（安全网：窗口切换事件漏了，轮询 150ms 后也能
+     * 补上）；只在“确实知道前台不是悬浮栏”时清，foregroundActivity 为 null
+     * 时无法判断，不清。
      */
     private fun maybeAutoListenOverlayPoll() {
         if (!::session.isInitialized) return
         if (!App.prefs.museOverlayInsert) return
         if (session.active || session.recording) return
-        if (overlayAutoSuppressed) return
-        if (!isMuseForeground()) return
         // foregroundActivity 可能为 null（服务重连后一直停在同一个 Activity
         // 里没切换）：像 maybeAutoPlayVoice 那样从 getWindows() 补学一次。
         if (foregroundActivity == null) {
@@ -592,13 +669,33 @@ class VoiceService : AccessibilityService() {
             } catch (_: Exception) {
             }
         }
-        val input = focusedInput() ?: return
-        if (!isMuseOverlaySearchBox(input)) return
+        // 悬浮栏在前台的判断要看 Activity，不只看包名——主聊天也在同一个包里。
+        val overlayFg = isMuseForeground() && foregroundActivity?.contains(OVERLAY_ACTIVITY) == true
+        if (!overlayFg) {
+            val knownNotOverlay = (foregroundActivity != null && !foregroundActivity!!.contains(OVERLAY_ACTIVITY)) || !isMuseForeground()
+            if (knownNotOverlay) clearSuppression("not-foreground")
+            return
+        }
+        val input = focusedInput()
+        val matched = input != null && isMuseOverlaySearchBox(input)
+        val action = focusedEditorAction()
+        val blockReason = when {
+            overlayAutoSuppressed -> "blocked suppressed=true"
+            input == null -> "blocked input=null"
+            action == EditorInfo.IME_ACTION_SEND -> "blocked ime-send"
+            !matched -> "blocked not-matched"
+            !nodeTextEmpty(input) -> "blocked text-not-empty"
+            else -> "trigger"
+        }
+        logTriggerState("POLL", input, matched, blockReason)
+        if (overlayAutoSuppressed) return
+        if (input == null) return
+        if (!matched) return
         // 聊天输入框（IME 动作 SEND）永不自动触发（Activity 已把聊天排除，
         // 这是第二道）
-        if (focusedEditorAction() == EditorInfo.IME_ACTION_SEND) return
+        if (action == EditorInfo.IME_ACTION_SEND) return
         if (!nodeTextEmpty(input)) return
-        Log.d(TAG, "muse overlay poll trigger: activity=$foregroundActivity")
+        logTrigger("POLL", "trigger activity=$foregroundActivity")
         session.autoStartOverlay()
     }
 
