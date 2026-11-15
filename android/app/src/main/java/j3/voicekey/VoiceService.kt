@@ -29,6 +29,13 @@ class VoiceService : AccessibilityService() {
     private var chord = Chord(chordKeys)
     /** 1.13.4 悬浮栏自动触发：自动会话结束后抑制再触发，直到框失焦或悬浮栏关掉再重新聚焦 */
     private var overlayAutoSuppressed = false
+    /**
+     * 1.13.5 前台 Activity 跟踪：TYPE_WINDOW_STATE_CHANGED 事件更新，认悬浮栏用。
+     * 只记类名含 "Activity" 的窗口（输入法窗口等非 Activity 窗口不覆盖），避免键盘弹出时
+     * 把前台 Activity 冲掉。初始为 null（服务重连后悬浮栏已在前台时，等下一次窗口切换再认）。
+     */
+    private var foregroundActivity: String? = null
+    private var foregroundActivityPkg: String? = null
 
     /** 设置页录制长按组合：非空时接管按键，录完回调结果；null 表示取消 */
     var recorder: ((List<Int>?) -> Unit)? = null
@@ -51,41 +58,57 @@ class VoiceService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(e: AccessibilityEvent) {
+        // 1.13.5：窗口切换时记下前台 Activity（认悬浮栏用），在评估之前更新，
+        // 同一个窗口切换事件的评估就能用上最新的 Activity。
+        if (e.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            val cls = e.className?.toString()
+            if (cls != null && cls.contains("Activity")) {
+                foregroundActivityPkg = e.packageName?.toString()
+                foregroundActivity = cls
+            }
+        }
         main.removeCallbacks(check)
         main.postDelayed(check, 150)
         maybeAutoListenOverlay(e)
     }
 
     /**
-     * 1.13.4 悬浮栏自动触发：只限 Muse 悬浮栏搜索框。聚焦或窗口切换时，如果当前聚焦框
-     * 是悬浮栏搜索框（IME 动作 SEARCH，或提示含“搜索”），且框里没字、没在会话中，就自动开始听，
-     * 说完自动上屏进这个框，不用按音量键、不用点悬浮球。聊天输入框是 SEND 动作，永不自动触发；
-     * 聊天里只手动。框里已有用户自己打的字时不触发；自动会话结束后抑制再触发，直到框失焦
-     * 或悬浮栏关掉再重新聚焦。开关 museOverlayInsert 关着时不自动触发。
+     * 1.13.5 悬浮栏自动触发：只限 Muse 悬浮栏搜索框。聚焦或窗口切换时，如果当前聚焦框
+     * 是悬浮栏搜索框，就自动开始听，说完自动上屏进这个框，不用按音量键、不用点悬浮球。
+     * 认框改按前台 Activity（见 isMuseOverlaySearchBox）：聊天输入框在主聊天 Activity 里，
+     * Activity 不同，天然排除——聊天里只手动，永不自动触发。框里已有用户自己打的字时不触发；
+     * 自动会话结束后抑制再触发，直到框失焦或悬浮栏关掉再重新聚焦。开关 museOverlayInsert
+     * 关着时不自动触发。
      * 注意：只负责自动开始听，不负责给框聚焦——点搜索框聚焦由小布模块做。
+     * 1.13.5 起每次评估都记一行 `muse overlay check`（不管匹不匹配、开关开不开），
+     * 这样日志里能直接看到它有没有跑、看到了什么，不用再猜。
      */
     private fun maybeAutoListenOverlay(e: AccessibilityEvent) {
-        if (!App.prefs.museOverlayInsert || !::session.isInitialized) return
         if (e.eventType != AccessibilityEvent.TYPE_VIEW_FOCUSED &&
             e.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
         ) return
+        if (!::session.isInitialized) return
         val pkg = e.packageName?.toString() ?: rootInActiveWindow?.packageName?.toString()
         if (pkg != MUSE_PKG) {
             if (e.packageName != null) overlayAutoSuppressed = false
             return
         }
-        if (session.active || session.recording) return
         val input = focusedInput()
+        val matched = input != null && isMuseOverlaySearchBox(input)
+        val action = focusedEditorAction()
+        Log.d(TAG, "muse overlay check: activity=$foregroundActivity pkg=$pkg nodeClass=${input?.className} inputType=${input?.inputType} hint=${input?.hintText} desc=${input?.contentDescription} imeAction=$action editable=${input?.isEditable} matched=$matched suppressed=$overlayAutoSuppressed switch=${App.prefs.museOverlayInsert} active=${session.active} recording=${session.recording}")
+        if (!App.prefs.museOverlayInsert) return
+        if (session.active || session.recording) return
         if (input == null) {
             // 失焦 / 悬浮栏关掉：解除抑制，等下次重新聚焦
             overlayAutoSuppressed = false
             return
         }
         if (overlayAutoSuppressed) return
-        // 明确限制：聊天输入框（IME 动作 SEND）永不自动触发
-        if (focusedEditorAction() == EditorInfo.IME_ACTION_SEND) return
+        // 明确限制：聊天输入框（IME 动作 SEND）永不自动触发（Activity 已把聊天排除，这是第二道）
+        if (action == EditorInfo.IME_ACTION_SEND) return
         if (!nodeTextEmpty(input)) return
-        if (!isMuseOverlaySearchBox(input)) return
+        if (!matched) return
         session.autoStartOverlay()
     }
 
@@ -117,26 +140,22 @@ class VoiceService : AccessibilityService() {
     /**
      * Muse 悬浮栏搜索框识别（与聊天界面的输入框区分）。
      *
-     * 两个包都叫 com.facebook.aura、窗口结构也无法从代码上可靠区分，所以不用窗口特征，
-     * 只用输入框自身的信号，主信号是输入法侧的动作：
-     * ① 当前聚焦编辑框的 IME 动作是“搜索”（IME_ACTION_SEARCH）——搜索框的典型动作，
-     *    聊天输入框的动作一般是“发送”，不会命中；
-     * ② 提示文字/内容描述含“搜索”/“Search”（备用信号）。
-     * 1.13.4 起只用来选上屏路径：命中走悬浮栏上屏，没命中走普通上屏路径，不再拒绝启动。
-     * 注意：这两个信号都未在真机悬浮栏上核对过——如果悬浮栏搜索框的 IME 动作不是
-     * SEARCH 且提示文字也不含“搜索”，悬浮栏会按普通路径上屏，届时按日志里的 imeAction/hint 再调。
+     * 1.13.5 起按前台 Activity 认，不再靠 IME 动作 / hint：
+     * ① 前台 Activity 是 Muse 悬浮栏（类名含 HatchAssistOverlayActivity）；
+     * ② 节点在 Muse 包里、类名是 android.widget.EditText、isEditable。
+     * 聊天输入框在主聊天 Activity（AuraMainActivity）里，Activity 不同，天然排除。
+     * IME 动作 / hint 只作加分信号（记在 maybeAutoListenOverlay 的 `muse overlay check`
+     * 日志里，方便核对），不再是必要条件——实测这个框的 a11y 节点 inputType=0、hint 为空，
+     * 1.13.4 那两条信号永远匹配不上，自动触发根本启动不了。
+     * 1.13.4 起只用来选上屏路径（手动触发）与自动触发的认框，不再拒绝启动。
      */
     fun isMuseOverlaySearchBox(node: AccessibilityNodeInfo): Boolean {
         if (!node.isEditable || !node.isVisibleToUser) return false
-        val action = focusedEditorAction()
-        Log.d(TAG, "muse overlay check: imeAction=$action hint=${node.hintText} desc=${node.contentDescription} showingHint=${node.isShowingHintText}")
-        if (action == EditorInfo.IME_ACTION_SEARCH) return true
-        val hints = listOfNotNull(
-            node.hintText?.toString(),
-            node.contentDescription?.toString(),
-            node.text?.toString().takeIf { node.isShowingHintText },
-        )
-        return hints.any { h -> SEARCH_HINTS.any { w -> h.contains(w, ignoreCase = true) } }
+        if (node.packageName?.toString() != MUSE_PKG) return false
+        if (node.className?.toString() != EDIT_TEXT_CLASS) return false
+        val activity = foregroundActivity ?: return false
+        if (foregroundActivityPkg != MUSE_PKG) return false
+        return activity.contains(OVERLAY_ACTIVITY)
     }
 
     /** 当前聚焦的编辑框在输入法侧的动作；未聚焦或无输入连接时返回 -1 */
@@ -358,10 +377,13 @@ class VoiceService : AccessibilityService() {
         var instance: VoiceService? = null
             private set
         private const val TAG = "VoiceKey"
-        /** Muse 包名：悬浮栏搜索框与聊天输入框同属此包，区分靠 isMuseOverlaySearchBox 的框内信号 */
+        /** Muse 包名：悬浮栏搜索框与聊天输入框同属此包，区分靠 isMuseOverlaySearchBox 的前台 Activity */
         private const val MUSE_PKG = "com.facebook.aura"
+        /** Muse 语音会话悬浮栏 Activity 的类名片段：前台是它才认作悬浮栏搜索框 */
+        private const val OVERLAY_ACTIVITY = "HatchAssistOverlayActivity"
+        /** 悬浮栏搜索框在无障碍层暴露的类名（小布模块 12:40 实测） */
+        private const val EDIT_TEXT_CLASS = "android.widget.EditText"
         private val SEND = listOf("发送", "Send")
-        private val SEARCH_HINTS = listOf("搜索", "搜", "Search")
         private val ACTIONS = setOf(EditorInfo.IME_ACTION_SEND, EditorInfo.IME_ACTION_GO, EditorInfo.IME_ACTION_SEARCH, EditorInfo.IME_ACTION_DONE)
 
         fun enabled(ctx: Context): Boolean {
