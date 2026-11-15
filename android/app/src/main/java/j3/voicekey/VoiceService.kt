@@ -37,9 +37,11 @@ class VoiceService : AccessibilityService() {
      */
     private var foregroundActivity: String? = null
     private var foregroundActivityPkg: String? = null
-    /** 1.13.8 Muse 语音自动播放：上次扫描时间（500ms 防抖）与已放过的播放按钮 bounds 集合 */
+    /** 1.13.8 Muse 语音自动播放：上次扫描时间（500ms 防抖）与已放过的语音气泡序号集合；
+     * 1.13.9 起序号是 key（从上往下 0 起），不用 bounds——bounds 会随聊天滚动变，播完
+     * 变回“播放”后对不上旧位置就重播；序号不随滚动变。 */
     private var lastVoiceScanMs = 0L
-    private val playedVoiceBounds = LinkedHashSet<String>()
+    private val playedVoiceIndex = LinkedHashSet<Int>()
 
     /** 设置页录制长按组合：非空时接管按键，录完回调结果；null 表示取消 */
     var recorder: ((List<Int>?) -> Unit)? = null
@@ -83,7 +85,9 @@ class VoiceService : AccessibilityService() {
      * 的节点，Muse 不在前台时自然不触发，不用另加前台判断。
      * 新消息出现（内容变化/滚动）时扫描一次，带 500ms 防抖；找到未播过的语音气泡
      * 就点它的播放按钮。只认未播状态（内容描述恰好是“播放”，播放中大概率变“暂停”
-     * 就不认）；播完变回“播放”时靠已放集合不再重播；新气泡（bounds 不同）才再放。
+     * 就不认）；播完变回“播放”时靠已放集合不再重播；新气泡（序号更大）才再放。
+     * 1.13.9：已放集合的 key 是语音气泡在当前全部语音气泡里的序号（从上往下 0 起），
+     * 不用 bounds——bounds 会随聊天滚动变，播完对不上旧位置就重播；序号不随滚动变。
      * 输入框、发送箭头、悬浮栏那条路都不碰。
      */
     private fun maybeAutoPlayVoice(e: AccessibilityEvent) {
@@ -96,38 +100,40 @@ class VoiceService : AccessibilityService() {
         if (now - lastVoiceScanMs < VOICE_SCAN_DEBOUNCE_MS) return
         lastVoiceScanMs = now
         val root = rootInActiveWindow ?: return
-        val play = findVoicePlayButton(root) ?: return
-        val key = voiceButtonKey(play)
-        if (key in playedVoiceBounds) return
+        val plays = findVoicePlayButtons(root)
+        if (plays.isEmpty()) return
+        val index = plays.size - 1
+        if (index in playedVoiceIndex) return
+        val play = plays[index]
         if (play.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-            playedVoiceBounds.add(key)
-            while (playedVoiceBounds.size > VOICE_PLAYED_CAP) playedVoiceBounds.remove(playedVoiceBounds.first())
-            Log.d(TAG, "muse voice autoplay: clicked play button bounds=$key")
+            playedVoiceIndex.add(index)
+            while (playedVoiceIndex.size > VOICE_PLAYED_CAP) playedVoiceIndex.remove(playedVoiceIndex.first())
+            Log.d(TAG, "muse voice autoplay: clicked play button index=$index count=${plays.size}")
         }
     }
 
     /**
-     * 找最下面一个语音气泡的播放按钮。语音三件套（2026-11-15 uiautomator dump
-     * 实测，Muse 聊天独有，链接卡片没有）：Button 内容描述“播放” + 同气泡里
-     * ProgressBar 内容描述“音频进度” + 时长 TextView（m:ss 格式，如 0:00）。
-     * 气泡本身不一定是 hatch-message-assistant-latest（最新文本消息占着它），
-     * 所以扫描全部助手气泡、取最下面那条；多条未播语音在屏上时取 top 最大的。
+     * 找全部语音气泡的播放按钮，按从上到下排好（序号 0 起，最下面那条序号最大）。
+     * 语音三件套（2026-11-15 uiautomator dump 实测，Muse 聊天独有，链接卡片没有）：
+     * Button 内容描述“播放” + 同气泡里 ProgressBar 内容描述“音频进度” +
+     * 时长 TextView（m:ss 格式，如 0:00）。气泡本身不一定是
+     * hatch-message-assistant-latest（最新文本消息占着它），所以扫描全部助手气泡；
+     * 多条未播语音在屏上时取最下面那条（序号最大）。
+     * 1.13.9：序号当已放集合的 key——序号不随聊天滚动变（新消息进来旧气泡序号不变；
+     * 新语音来了它是序号最大的那条），bounds 当 key 会随滚动变、播完变回“播放”后
+     * 对不上旧位置就重播。
      */
-    private fun findVoicePlayButton(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        var best: AccessibilityNodeInfo? = null
-        var bestTop = Int.MIN_VALUE
+    private fun findVoicePlayButtons(root: AccessibilityNodeInfo): List<AccessibilityNodeInfo> {
+        val found = mutableListOf<Pair<AccessibilityNodeInfo, Int>>()
         val b = Rect()
         for (n in collectNodes(root)) {
             if (n.className?.toString() != BUTTON_CLASS) continue
             if (n.contentDescription?.toString()?.trim() != PLAY_DESC) continue
             if (!isVoiceBubble(n)) continue
             n.getBoundsInScreen(b)
-            if (b.top > bestTop) {
-                bestTop = b.top
-                best = n
-            }
+            found.add(n to b.top)
         }
-        return best
+        return found.sortedBy { it.second }.map { it.first }
     }
 
     /** 该播放按钮所在的气泡里是否同时有“音频进度”进度条和 m:ss 时长文本 */
@@ -159,13 +165,6 @@ class VoiceService : AccessibilityService() {
             if (hasProgress && hasDuration) return true
         }
         return false
-    }
-
-    /** 已放集合的 key：播放按钮的屏幕 bounds；同一气泡播完变回“播放”时 bounds 不变，不再重播 */
-    private fun voiceButtonKey(play: AccessibilityNodeInfo): String {
-        val b = Rect()
-        play.getBoundsInScreen(b)
-        return b.toString()
     }
 
     /**
