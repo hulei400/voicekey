@@ -43,7 +43,11 @@ class VoiceService : AccessibilityService() {
      * 才点最下面那条；个数没变就什么都不做，播完变回“播放”也不会重播。
      * key 是前台 Activity 类名（悬浮栏 HatchAssistOverlayActivity 和主聊天
      * AuraMainActivity 各记各的），切窗口不会互相干扰；某窗口第一次见时只记
-     * 个数、不点，避免把旧气泡当成新的放出来。 */
+     * 个数、不点，避免把旧气泡当成新的放出来。
+     * 1.13.11：数的必须是对面“全部”气泡——1.13.10 只数未播（只认“播放”），
+     * 播着的（按钮变“暂停”）不算，个数随播放状态 0↔1 震荡，0→1 被误当成新消息，
+     * 同一条 53 秒里被点了 9 次。改成按钮“播放”或“暂停”都算，个数不再跟播放
+     * 状态走；点之前再看最下面那条按钮是不是“播放”（“暂停”就跳过）。 */
     private var lastVoiceScanMs = 0L
     private val lastVoiceCountByWindow = mutableMapOf<String, Int>()
 
@@ -97,6 +101,12 @@ class VoiceService : AccessibilityService() {
      * 不点。输入框、发送箭头、悬浮栏那条路都不碰。
      * 每次扫描记一行 vk-autoplay-trace.log（时间/窗口/个数/上次个数/动作与理由），
      * Log.d 不进 logcat，决策不能再是黑盒。
+     * 1.13.11：数的必须是对面“全部”气泡——1.13.10 只数未播（只认“播放”按钮），
+     * 播着的按钮变“暂停”不算，个数随播放状态 0↔1 震荡（播完变回“播放”又回到 1），
+     * 0→1 被误当成新消息，同一条 53 秒里被点了 9 次。改成按钮“播放”或“暂停”
+     * 都算一个气泡，个数不再跟播放状态走；点之前再看最下面那条按钮是不是“播放”
+     * （“暂停”就跳过）。进度控件按 content-desc“音频进度”认（未播时是
+     * ProgressBar、播着时是 SeekBar，别写死类名）。
      */
     private fun maybeAutoPlayVoice(e: AccessibilityEvent) {
         if (e.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED &&
@@ -120,7 +130,7 @@ class VoiceService : AccessibilityService() {
             logAutoplay(activity, -1, -1, "skip no-root")
             return
         }
-        val plays = findVoicePlayButtons(root)
+        val plays = findVoiceBubbleButtons(root)
         val count = plays.size
         val prev = lastVoiceCountByWindow[activity]
         lastVoiceCountByWindow[activity] = count
@@ -133,6 +143,10 @@ class VoiceService : AccessibilityService() {
             return
         }
         val play = plays[count - 1]
+        if (play.contentDescription?.toString()?.trim() != PLAY_DESC) {
+            logAutoplay(activity, count, prev, "skip bottom-most-already-playing")
+            return
+        }
         val clicked = play.performAction(AccessibilityNodeInfo.ACTION_CLICK)
         logAutoplay(activity, count, prev, "click bottom-most clicked=$clicked")
         if (clicked) Log.d(TAG, "muse voice autoplay: clicked play button count=$count prev=$prev activity=$activity")
@@ -152,20 +166,24 @@ class VoiceService : AccessibilityService() {
     }
 
     /**
-     * 找全部语音气泡的播放按钮，按从上到下排好（序号 0 起，最下面那条序号最大）。
+     * 找全部语音气泡的播放/暂停按钮，按从上到下排好（最下面那条在最后）。
      * 语音三件套（2026-11-15 uiautomator dump 实测，Muse 聊天独有，链接卡片没有）：
-     * Button 内容描述“播放” + 同气泡里 ProgressBar 内容描述“音频进度” +
+     * Button 内容描述“播放”或“暂停” + 同气泡里进度控件内容描述“音频进度” +
      * 时长 TextView（m:ss 格式，如 0:00）。气泡本身不一定是
      * hatch-message-assistant-latest（最新文本消息占着它），所以扫描全部助手气泡；
-     * 多条未播语音在屏上时取最下面那条。
+     * 多条语音在屏上时取最下面那条。
      * 1.13.10 起返回的列表只用来数个数和取最下面那条，不再用序号/bounds 当 key。
+     * 1.13.11：按钮“播放”和“暂停”都算——只数未播的（只认“播放”）会随播放状态
+     * 震荡（播着变“暂停”不算、播完变回“播放”又算，0→1 被误当成新消息，同一条
+     * 53 秒被点 9 次）。数全部气泡，个数才不跟播放状态走。
      */
-    private fun findVoicePlayButtons(root: AccessibilityNodeInfo): List<AccessibilityNodeInfo> {
+    private fun findVoiceBubbleButtons(root: AccessibilityNodeInfo): List<AccessibilityNodeInfo> {
         val found = mutableListOf<Pair<AccessibilityNodeInfo, Int>>()
         val b = Rect()
         for (n in collectNodes(root)) {
             if (n.className?.toString() != BUTTON_CLASS) continue
-            if (n.contentDescription?.toString()?.trim() != PLAY_DESC) continue
+            val desc = n.contentDescription?.toString()?.trim()
+            if (desc != PLAY_DESC && desc != PAUSE_DESC) continue
             if (!isVoiceBubble(n)) continue
             n.getBoundsInScreen(b)
             found.add(n to b.top)
@@ -173,9 +191,9 @@ class VoiceService : AccessibilityService() {
         return found.sortedBy { it.second }.map { it.first }
     }
 
-    /** 该播放按钮所在的气泡里是否同时有“音频进度”进度条和 m:ss 时长文本 */
-    private fun isVoiceBubble(play: AccessibilityNodeInfo): Boolean {
-        var anc = play.parent
+    /** 该播放/暂停按钮所在的气泡里是否同时有“音频进度”进度控件和 m:ss 时长文本 */
+    private fun isVoiceBubble(button: AccessibilityNodeInfo): Boolean {
+        var anc = button.parent
         var depth = 0
         while (anc != null && depth < 6) {
             if (subtreeHasVoiceSignature(anc)) return true
@@ -185,7 +203,10 @@ class VoiceService : AccessibilityService() {
         return false
     }
 
-    /** 子树里是否同时有内容描述“音频进度”的 ProgressBar 和 m:ss 格式的 TextView */
+    /** 子树里是否同时有内容描述“音频进度”的进度控件和 m:ss 格式的 TextView。
+     * 1.13.11：进度控件只按 content-desc 认，别写死类名——未播时是 ProgressBar、
+     * 播着时是 SeekBar（SeekBar 是 ProgressBar 的子类），只认类名会把播着的
+     * 气泡漏掉。 */
     private fun subtreeHasVoiceSignature(root: AccessibilityNodeInfo): Boolean {
         var hasProgress = false
         var hasDuration = false
@@ -197,7 +218,7 @@ class VoiceService : AccessibilityService() {
             seen++
             for (i in 0 until n.childCount) n.getChild(i)?.let { stack.add(it) }
             val cls = n.className?.toString()
-            if (cls == PROGRESS_CLASS && n.contentDescription?.toString()?.trim() == PROGRESS_DESC) hasProgress = true
+            if (n.contentDescription?.toString()?.trim() == PROGRESS_DESC) hasProgress = true
             if (cls == TEXT_VIEW_CLASS && DURATION_RE.matches(n.text?.toString().orEmpty())) hasDuration = true
             if (hasProgress && hasDuration) return true
         }
@@ -518,7 +539,7 @@ class VoiceService : AccessibilityService() {
         /** 1.13.8 语音自动播放：播放按钮与进度条的类名/内容描述（2026-11-15 dump 实测的固定字面串） */
         private const val BUTTON_CLASS = "android.widget.Button"
         private const val PLAY_DESC = "播放"
-        private const val PROGRESS_CLASS = "android.widget.ProgressBar"
+        private const val PAUSE_DESC = "暂停"
         private const val PROGRESS_DESC = "音频进度"
         private const val TEXT_VIEW_CLASS = "android.widget.TextView"
         private val DURATION_RE = Regex("^\\d+:\\d{2}$")
