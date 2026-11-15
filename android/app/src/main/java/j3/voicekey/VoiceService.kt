@@ -56,16 +56,31 @@ class VoiceService : AccessibilityService() {
      * Activity 里不切换，Activity 就永远是 null，扫描一次都没跑过）。改成
      * 先拿包名当门，状态 key 用“Activity（取得到时）否则上次窗口否则包名”；
      * 转写身份存 SHA-256 前 16 位（只比相等，不存全文），状态持久化到
-     * SharedPreferences “voice_autoplay”，服务重启也不丢。 */
+     * SharedPreferences “voice_autoplay”，服务重启也不丢。
+     * 1.13.15：滑到底那道闸从来就没工作过——日志 3118 行里 atBottom 全是
+     * null、to= 出现 0 次，LazyColumn 根本不在无障碍滚动事件里填 itemCount/
+     * toIndex，代码永远走退路；退路又只看上一轮可见集合，可见个数随重组在
+     * 1↔2↔3 抖，集合一缩水旧语音就被当成新的点（14:56-15:01 五分钟点 27 次，
+     * 几乎全是旧语音重播）。改成两个持久集合：playedTranscripts（点过放过
+     * 的文字）+ seenTranscripts（以前任何一轮扫描里露过脸的文字），都存
+     * SHA-256 前 16 位，放 voice_autoplay，封顶 500 条先进先出；最下面那条
+     * 的文字既不在 seen 也不在 played 里才点，点了记进 played；窗口第一次
+     * 扫描只记不点（基线）；atBottom 门控和 lastPlayed 单值删掉（死的，别
+     * 再靠它）；滚动方向闸不要了（滚动数据根本拿不到）。另加短转写过滤：
+     * 长度 <4 或命中已知 UI 标签（“消息”）的文字不点——气泡在视口边缘、真
+     * 文字被滑出视野时查找会抓附近 UI 文本当身份（len=2 的“消息”被点 8 次）。
+     * 残留缺口：一条旧语音以前从没露过脸，往上滑第一次翻出来时可能还是会
+     * 放一次，放过就记住了，以后再滑到也不放（只看视口的固有限制，接受）。 */
     private var lastVoiceScanMs = 0L
     /** 1.13.14 自动播放状态持久化（SharedPreferences “voice_autoplay”）。 */
     private val autoplayPrefs by lazy { getSharedPreferences("voice_autoplay", Context.MODE_PRIVATE) }
-    /** 1.13.13 该窗口上次放过的语音的文字身份（SHA-256 前 16 位）。 */
-    private val lastPlayedTranscriptByWindow = mutableMapOf<String, String>()
-    /** 1.13.13 上次扫描时该窗口可见的全部语音文字身份（SHA-256 前 16 位；
-     * 新旧判断用：文字不在上一次可见集合里，说明它刚进视口；滚动回旧语音时
-     * 文字早在集合里，不点）。 */
-    private val lastScanTranscriptsByWindow = mutableMapOf<String, Set<String>>()
+    /** 1.13.15 该窗口点过（放过）的语音文字身份（SHA-256 前 16 位），持久化。
+     * LinkedHashSet 保插入顺序，封顶 AUTOPLAY_SET_CAP 条、先进先出。 */
+    private val playedTranscriptsByWindow = mutableMapOf<String, LinkedHashSet<String>>()
+    /** 1.13.15 该窗口以前任何一轮扫描里露过脸的语音文字身份（SHA-256 前 16 位），
+     * 持久化。每次扫描把本轮可见的全部文字都加进来；一条旧语音只要以前露过
+     * 脸，往上滑再见到它也不会点——不管视口怎么抖、不管用户怎么滑。 */
+    private val seenTranscriptsByWindow = mutableMapOf<String, LinkedHashSet<String>>()
     /** 1.13.12 上一次确定的前台 Activity；1.13.14 起只用来在 Activity 取不到
      * 时当窗口 key 的退路（和诊断），不再是自动播放的硬门。 */
     private var lastKnownVoiceWindow: String? = null
@@ -80,39 +95,89 @@ class VoiceService : AccessibilityService() {
         }
     }
 
-    /** 1.13.14 从 SharedPreferences 恢复自动播放状态（服务重连时调一次）。
-     * 键：lastPlayed.<窗口>、lastSeen.<窗口>、lastWindow。 */
+    /** 1.13.15 从 SharedPreferences 恢复自动播放状态（服务重连时调一次）。
+     * 键：played.<窗口>、seen.<窗口>（逗号拼起来的 SHA-256 前 16 位，按插入
+     * 顺序排）、lastWindow。另兼容 1.13.14 的旧键：lastPlayed.<窗口>（单条）
+     * 并进 played，lastSeen.<窗口>（上一轮可见集合）并进 seen，读完删旧键。 */
     private fun loadAutoplayState() {
         try {
-            for ((k, v) in autoplayPrefs.all) {
+            val all = autoplayPrefs.all
+            for ((k, v) in all) {
                 when {
-                    k.startsWith("lastPlayed.") && v is String ->
-                        lastPlayedTranscriptByWindow[k.removePrefix("lastPlayed.")] = v
-                    k.startsWith("lastSeen.") && v is Set<*> ->
-                        lastScanTranscriptsByWindow[k.removePrefix("lastSeen.")] =
-                            v.filterIsInstance<String>().toSet()
+                    k.startsWith("played.") && v is String ->
+                        playedTranscriptsByWindow[k.removePrefix("played.")] =
+                            LinkedHashSet(v.split(',').filter { it.isNotEmpty() })
+                    k.startsWith("seen.") && v is String ->
+                        seenTranscriptsByWindow[k.removePrefix("seen.")] =
+                            LinkedHashSet(v.split(',').filter { it.isNotEmpty() })
                     k == "lastWindow" && v is String -> lastKnownVoiceWindow = v
                 }
             }
+            val ed = autoplayPrefs.edit()
+            var migrated = false
+            for ((k, v) in all) {
+                when {
+                    k.startsWith("lastPlayed.") && v is String -> {
+                        playedTranscriptsByWindow.getOrPut(k.removePrefix("lastPlayed.")) { LinkedHashSet() }.add(v)
+                        ed.remove(k)
+                        migrated = true
+                    }
+                    k.startsWith("lastSeen.") && v is Set<*> -> {
+                        seenTranscriptsByWindow.getOrPut(k.removePrefix("lastSeen.")) { LinkedHashSet() }
+                            .addAll(v.filterIsInstance<String>())
+                        ed.remove(k)
+                        migrated = true
+                    }
+                }
+            }
+            if (migrated) ed.apply()
         } catch (_: Exception) {
         }
     }
 
-    private fun saveLastPlayed(window: String, key: String) {
-        try { autoplayPrefs.edit().putString("lastPlayed.$window", key).apply() } catch (_: Exception) { }
+    /** 1.13.15 取某窗口的持久集合，并定下这轮用的 key：Activity key 有状态
+     * 就用它；没有就退到包名 key（服务重启后 Activity 才学到，之前的状态
+     * 可能记在包名 key 下，升级迁移的旧状态也在包名 key 下）；两个都没有
+     * 就在 Activity key 下建空集。返回（key，集合）。 */
+    private fun autoplaySet(map: MutableMap<String, LinkedHashSet<String>>, activity: String): Pair<String, LinkedHashSet<String>> {
+        map[activity]?.let { return activity to it }
+        if (activity != MUSE_PKG) {
+            map[MUSE_PKG]?.let {
+                map[activity] = it
+                return activity to it
+            }
+        }
+        val s = LinkedHashSet<String>()
+        map[activity] = s
+        return activity to s
     }
 
-    private fun saveLastSeen(window: String, keys: Set<String>) {
-        try { autoplayPrefs.edit().putStringSet("lastSeen.$window", keys).apply() } catch (_: Exception) { }
+    /** 1.13.15 集合封顶（先进先出）：LinkedHashSet 按插入顺序排，超了删最老的。 */
+    private fun trimAutoplaySet(s: LinkedHashSet<String>) {
+        while (s.size > AUTOPLAY_SET_CAP) s.remove(s.first())
+    }
+
+    private fun savePlayed(window: String) {
+        try {
+            val s = playedTranscriptsByWindow[window] ?: return
+            autoplayPrefs.edit().putString("played.$window", s.joinToString(",")).apply()
+        } catch (_: Exception) { }
+    }
+
+    private fun saveSeen(window: String) {
+        try {
+            val s = seenTranscriptsByWindow[window] ?: return
+            autoplayPrefs.edit().putString("seen.$window", s.joinToString(",")).apply()
+        } catch (_: Exception) { }
     }
 
     private fun saveLastWindow(window: String) {
         try { autoplayPrefs.edit().putString("lastWindow", window).apply() } catch (_: Exception) { }
     }
-    /** 1.13.13 最近一次滚动事件（TYPE_VIEW_SCROLLED，在 Muse 包里才记）：
-     * 列表滑到底的判断。LazyColumn 滚动事件是否报真实总数（itemCount），
-     * 实现时没法在盒子上验——把它写进日志，真机上能从日志反推；拿不到
-     * 总数时走“文字是否刚进视口”的退路。 */
+    /** 1.13.13 最近一次滚动事件（TYPE_VIEW_SCROLLED，在 Muse 包里才记）。
+     * 1.13.15：滑到底的门控已删——日志 3118 行证明滚动事件从来不带
+     * itemCount/toIndex，atBottom 恒为 null，这道闸是死的。这两个字段
+     * 只留作诊断：每行日志记 scrollData=yes/no，记录滚动事件到底带不带数据。 */
     private var lastScrollToIndex = -1
     private var lastScrollItemCount = -1
     /** 1.13.13 最近一次内容变化事件的时间（elapsedRealtime，诊断用）。 */
@@ -184,6 +249,19 @@ class VoiceService : AccessibilityService() {
      * 时）否则上次窗口否则包名”，读不到 Activity key 时退到包名 key；转写
      * 身份存 SHA-256 前 16 位，状态（各窗口上次放过的文字身份、上次可见集合、
      * 上次窗口）持久化到 SharedPreferences “voice_autoplay”，服务重启也不丢。
+     * 1.13.15：滑到底那道闸从来就没工作过（日志 3118 行里 atBottom 全是
+     * null、to= 出现 0 次，LazyColumn 根本不在滚动事件里填 itemCount/toIndex，
+     * 代码永远走退路）；退路只看上一轮可见集合，可见个数随重组在 1↔2↔3 抖，
+     * 集合一缩水旧语音就被当成新的点（14:56-15:01 五分钟点 27 次，几乎全是
+     * 旧语音重播）。改成两个持久集合：playedTranscripts（点过放过的文字）+
+     * seenTranscripts（以前任何一轮露过脸的文字），都存 SHA-256 前 16 位、
+     * 放 voice_autoplay、封顶 500 条先进先出；最下面那条的文字既不在 seen
+     * 也不在 played 里才点，点了记进 played；窗口第一次扫描只记不点（基线）；
+     * atBottom 门控和 lastPlayed 单值删掉；滚动方向闸不要了（滚动数据根本
+     * 拿不到）。另加短转写过滤：长度 <4 或命中已知 UI 标签（“消息”）的文字
+     * 不点（气泡在视口边缘、真文字被滑出视野时查找会抓附近 UI 文本当身份）。
+     * 残留缺口：一条旧语音以前从没露过脸，往上滑第一次翻出来时可能还是会
+     * 放一次，放过就记住了，以后再滑到也不放（只看视口的固有限制，接受）。
      */
     private fun maybeAutoPlayVoice(e: AccessibilityEvent) {
         // 1.13.13：先记滚动/内容变化信号（不管这次事件会不会触发扫描），滑到底
@@ -242,14 +320,6 @@ class VoiceService : AccessibilityService() {
         }
         val bubbles = findVoiceBubbles(root)
         val count = bubbles.size
-        // 退路用的上一轮可见文字集合（身份是 SHA-256 前 16 位）：先读出来，再记
-        // 这一轮的。读不到 Activity key 时退到包名 key——Activity 是重启后才学
-        // 到的，之前的状态可能记在包名 key 下；两个 key 都没有才算第一次见。
-        val prevVisible = lastScanTranscriptsByWindow[activity]
-            ?: if (activity != MUSE_PKG) lastScanTranscriptsByWindow[MUSE_PKG] else null
-        val thisVisible = bubbles.mapNotNull { it.second }.map { transcriptKey(it) }.toSet()
-        lastScanTranscriptsByWindow[activity] = thisVisible
-        saveLastSeen(activity, thisVisible)
         if (bubbles.isEmpty()) {
             logAutoplay(activity, count, -1, "skip no-voice-bubbles")
             return
@@ -262,56 +332,79 @@ class VoiceService : AccessibilityService() {
         }
         val tag = transcriptTag(transcript)
         val tkey = transcriptKey(transcript)
-        // 1.13.13 按文字认语音：第一次见某窗口只记文字身份、不点。读不到
-        // Activity key 时退到包名 key。
-        val lastPlayed = lastPlayedTranscriptByWindow[activity]
-            ?: if (activity != MUSE_PKG) lastPlayedTranscriptByWindow[MUSE_PKG] else null
-        if (lastPlayed == null) {
-            lastPlayedTranscriptByWindow[activity] = tkey
-            saveLastPlayed(activity, tkey)
+        // 1.13.15 持久集合：本轮可见的真实转写文字身份（SHA-256 前 16 位）全
+        // 部并进 seen——不管视口怎么抖、不管用户怎么滑，一条旧语音只要以前
+        // 露过脸就不会再点。短转写 / UI 标签不进集合（那是查找抓错的幻影）。
+        // 先判它以前见没见过、再并进来：不然这轮刚并进去就查“在不在 seen 里”
+        // 永远是“在”，新语音也点不出来。
+        val (seenKey, seen) = autoplaySet(seenTranscriptsByWindow, activity)
+        val (playedKey, played) = autoplaySet(playedTranscriptsByWindow, activity)
+        val isFirstScan = seen.isEmpty() && played.isEmpty()
+        val wasSeen = tkey in seen
+        val wasPlayed = tkey in played
+        val thisVisible = bubbles.mapNotNull { it.second }
+            .filter { isRealTranscript(it) }.map { transcriptKey(it) }
+        if (seen.addAll(thisVisible)) {
+            trimAutoplaySet(seen)
+            saveSeen(seenKey)
+        }
+        // 1.13.15 短转写过滤：长度 <4 或命中已知 UI 标签（“消息”）的文字不点
+        // ——气泡在视口边缘、真文字被滑出视野时，查找会抓附近的 UI 文本当
+        // 身份（len=2 的“消息”被点 8 次）。漏放比乱放好。
+        if (!isRealTranscript(transcript)) {
+            logAutoplay(activity, count, -1, "skip transcript-too-short $tag")
+            return
+        }
+        // 1.13.15 首次扫描基线：窗口第一次见时只记不点，装机时已在视口里的
+        // 旧语音永远不会被点（这轮可见的文字上面已经全并进 seen 了）。
+        if (isFirstScan) {
             logAutoplay(activity, count, -1, "baseline first-scan-in-window $tag")
             return
         }
-        if (tkey == lastPlayed) {
-            logAutoplay(activity, count, -1, "skip same-transcript $tag")
+        // 1.13.15 点最下面那条的规则：文字既不在 seen 也不在 played 里才点。
+        // seen 是以前任何一轮露过脸的文字，played 是点过放过的文字；视口抖
+        // 动、用户上下滑都不会把旧语音变回“新的”。（wasSeen/wasPlayed 是
+        // 并进 seen 之前判的，不然新语音这轮一并进来就变成“见过”了。）
+        if (wasPlayed) {
+            logAutoplay(activity, count, -1, "skip already-played $tag")
             return
         }
-        // 滑到底的判断：滚动事件 toIndex >= itemCount - 1。LazyColumn 滚动事件
-        // 是否报真实总数（itemCount）实现时没法在盒子上验——拿不到就走退路。
-        val atBottom: Boolean? =
-            if (lastScrollItemCount > 0 && lastScrollToIndex >= 0) lastScrollToIndex >= lastScrollItemCount - 1 else null
-        if (atBottom == false) {
-            logAutoplay(activity, count, -1, "skip not-at-bottom to=$lastScrollToIndex total=$lastScrollItemCount $tag")
-            return
-        }
-        // 退路：拿不到总数时，光靠“文字变了”还不够——用户往上翻、把一条旧语音翻
-        // 到视口底部时文字也会变。要求这条文字不在上次扫描可见的集合里（刚进
-        // 视口的新语音才满足）；拿得到总数且已滑到底时不用这道闸。
-        if (atBottom == null && prevVisible != null && tkey in prevVisible) {
-            logAutoplay(activity, count, -1, "skip transcript-already-visible $tag")
+        if (wasSeen) {
+            logAutoplay(activity, count, -1, "skip already-seen $tag")
             return
         }
         val play = bottom.first
         if (play.contentDescription?.toString()?.trim() != PLAY_DESC) {
             // 已经在播了（用户手动点了、或之前放过）：记成已放，播完变回“播放”
             // 后别再点它一遍。
-            lastPlayedTranscriptByWindow[activity] = tkey
-            saveLastPlayed(activity, tkey)
+            if (played.add(tkey)) {
+                trimAutoplaySet(played)
+                savePlayed(playedKey)
+            }
             logAutoplay(activity, count, -1, "skip bottom-most-already-playing $tag")
             return
         }
         val clicked = play.performAction(AccessibilityNodeInfo.ACTION_CLICK)
         if (clicked) {
-            lastPlayedTranscriptByWindow[activity] = tkey
-            saveLastPlayed(activity, tkey)
+            if (played.add(tkey)) {
+                trimAutoplaySet(played)
+                savePlayed(playedKey)
+            }
         }
-        logAutoplay(activity, count, -1, "click bottom-most clicked=$clicked atBottom=$atBottom $tag")
+        logAutoplay(activity, count, -1, "click bottom-most clicked=$clicked $tag")
         if (clicked) Log.d(TAG, "muse voice autoplay: clicked play button $tag activity=$activity")
     }
 
     /** 1.13.13 日志用标签：只记文字长度 + 前 4 字，不记全文。 */
     private fun transcriptTag(t: String): String =
         "len=${t.length} head=${t.take(4).replace('\n', ' ').replace('\r', ' ')}"
+
+    /** 1.13.15 真转写才认：长度 >= 4 且不是已知 UI 标签。气泡在视口边缘、
+     * 真文字被滑出视野时，查找会抓附近的 UI 文本（“消息” len=2）当身份。 */
+    private fun isRealTranscript(t: String): Boolean {
+        val s = t.trim()
+        return s.length >= 4 && s !in UI_LABEL_TRANSCRIPTS
+    }
 
     /** 1.13.10 自动播放文件日志：Log.d 不进 logcat，决策写文件（VoiceKey files 目录的
      * vk-autoplay-trace.log，和 vk-session-trace.log 分开），每次扫描一行——时间、
@@ -322,7 +415,10 @@ class VoiceService : AccessibilityService() {
             val f = java.io.File(filesDir, "vk-autoplay-trace.log")
             if (f.exists() && f.length() > 512 * 1024) f.delete()
             val wall = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US).format(java.util.Date(System.currentTimeMillis()))
-            f.appendText("$wall activity=$activity count=$count prev=$prev $msg\n")
+            // 1.13.15 每行记滚动数据有没有（scrollData=yes/no）：滚动事件到底
+            // 带不带 itemCount/toIndex，下次诊断能直接断定。
+            val scrollData = if (lastScrollItemCount > 0 && lastScrollToIndex >= 0) "yes" else "no"
+            f.appendText("$wall activity=$activity count=$count prev=$prev scrollData=$scrollData $msg\n")
         } catch (_: Exception) {
         }
     }
@@ -727,6 +823,10 @@ class VoiceService : AccessibilityService() {
         private const val TEXT_VIEW_CLASS = "android.widget.TextView"
         private val DURATION_RE = Regex("^\\d+:\\d{2}$")
         private const val VOICE_SCAN_DEBOUNCE_MS = 500L
+        /** 1.13.15 持久集合封顶（条数，先进先出）。 */
+        private const val AUTOPLAY_SET_CAP = 500
+        /** 1.13.15 已知 UI 标签（不是语音文字）：查找抓错时会把它们当成转写。 */
+        private val UI_LABEL_TRANSCRIPTS = setOf("消息")
         /** 1.13.13 转写文字离播放按钮顶边的最大距离（px；实测约 66-90px，留足余量）。 */
         private const val TRANSCRIPT_MAX_GAP = 500
         /** 1.13.13 转写文字的左边缘上限（px；助手文字 x≈96-144，用户文字右对齐 x≥354）。 */
