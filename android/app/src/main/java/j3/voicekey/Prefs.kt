@@ -108,6 +108,11 @@ class Prefs(ctx: Context) {
         get() = if (sp.contains("pickSend")) sp.getBoolean("pickSend", false) else sp.getBoolean("jevSend", false)
         set(v) = sp.edit().putBoolean("pickSend", v).apply()
 
+    /** 小布全自动（只在 Muse 里）：输入框聚焦就自动听，说完自动上屏并发送；默认开，手动流程不受影响 */
+    var autoMuseFlow: Boolean
+        get() = sp.getBoolean("autoMuseFlow", true)
+        set(v) = sp.edit().putBoolean("autoMuseFlow", v).apply()
+
     /** 上次自动检查更新的时间（毫秒），用于 12 小时节流 */
     var updateCheckedAt: Long
         get() = sp.getLong("updateCheckedAt", 0L)

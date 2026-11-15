@@ -2,11 +2,13 @@ package j3.voicekey
 
 import android.accessibilityservice.AccessibilityService
 import android.content.Context
+import android.graphics.Rect
 import android.media.AudioManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.util.Log
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.accessibility.AccessibilityEvent
@@ -25,6 +27,8 @@ class VoiceService : AccessibilityService() {
     private val check = Runnable { refresh() }
     private var chordKeys = App.prefs.holdKeys
     private var chord = Chord(chordKeys)
+    /** 小布全自动：发完一次后抑制，直到输入框失焦再重新聚焦才允许下一次自动触发 */
+    private var autoSuppressed = false
 
     /** 设置页录制长按组合：非空时接管按键，录完回调结果；null 表示取消 */
     var recorder: ((List<Int>?) -> Unit)? = null
@@ -49,6 +53,68 @@ class VoiceService : AccessibilityService() {
     override fun onAccessibilityEvent(e: AccessibilityEvent) {
         main.removeCallbacks(check)
         main.postDelayed(check, 150)
+        maybeAutoListen(e)
+    }
+
+    /**
+     * 小布全自动触发点：只在 Muse（com.facebook.aura）里触发，别的应用的输入框绝不自动听。
+     * 聚焦或窗口切换时：已有可编辑输入框就直接听；还没聚焦就先让它聚焦（不行再点一下），
+     * 点后的聚焦事件会再进来一次。框里已有用户自己打的字时不自动听，避免追加到半句话后面。
+     */
+    private fun maybeAutoListen(e: AccessibilityEvent) {
+        if (!App.prefs.autoMuseFlow || !::session.isInitialized) return
+        if (e.eventType != AccessibilityEvent.TYPE_VIEW_FOCUSED &&
+            e.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+        ) return
+        val pkg = e.packageName?.toString() ?: rootInActiveWindow?.packageName?.toString()
+        if (pkg != MUSE_PKG) {
+            if (e.packageName != null) autoSuppressed = false
+            return
+        }
+        if (session.active || session.recording) return
+        val input = focusedInput()
+        if (input == null) {
+            // 失焦了：解除抑制，等下次重新聚焦；顺便找框聚焦（点后的聚焦事件会再进来）
+            autoSuppressed = false
+            rootInActiveWindow?.let { findEditable(it) }?.let { node ->
+                if (!node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)) {
+                    node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                }
+            }
+            return
+        }
+        if (autoSuppressed) return
+        val txt = input.text?.toString().orEmpty()
+        if (txt.isNotEmpty() && !input.isShowingHintText) return
+        session.beginAuto()
+    }
+
+    /** 窗口树里找第一个可见的可编辑节点（只找，不写） */
+    private fun findEditable(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        var seen = 0
+        while (stack.isNotEmpty() && seen < 300) {
+            val n = stack.removeLast()
+            seen++
+            if (n.isEditable && n.isVisibleToUser) return n
+            for (i in 0 until n.childCount) n.getChild(i)?.let { stack.add(it) }
+        }
+        return null
+    }
+
+    /**
+     * 小布全自动：上屏成功后等界面稳定一下（500ms，send 内部首试还有约 450ms，共约 1 秒）
+     * 再点发送；同时抑制下一次自动触发，直到输入框失焦再重新聚焦。
+     */
+    fun autoSend(node: AccessibilityNodeInfo?) {
+        autoSuppressed = true
+        main.postDelayed({ send(node) }, 500)
+    }
+
+    /** 自动流程结束且无有效上屏（没听清/上屏失败/超时）：抑制到下一次失焦再聚焦，避免反复自动听 */
+    fun suppressAutoFlow() {
+        autoSuppressed = true
     }
 
     override fun onInterrupt() {}
@@ -92,22 +158,84 @@ class VoiceService : AccessibilityService() {
             when {
                 clickSend(node) -> {}
                 tries > 1 -> send(node, tries - 1)
-                !editorSend() -> hud.info("没找到发送按钮，已上屏")
+                !editorSend() -> {
+                    Log.w(TAG, "autoSend: send button not found, text kept in editor")
+                    hud.info("没找到发送按钮，已上屏")
+                }
             }
         }, 150L * (4 - tries))
     }
 
+    /**
+     * 找发送按钮，三层后路：① 内容描述含“发送” ② 文本等于“发送” ③ 输入框附近的 ImageButton；
+     * 命中后沿父级找可点的节点再点。都找不到返回 false，由上层走输入法发送动作/回车。
+     */
     private fun clickSend(node: AccessibilityNodeInfo?): Boolean {
         val root = node?.window?.root ?: rootInActiveWindow ?: return false
-        val hit = SEND.firstNotNullOfOrNull { w ->
+        val hit = findSendByDesc(root)
+            ?: findSendByText(root)
+            ?: findSendNearInput(root, node)
+            ?: return false
+        var n: AccessibilityNodeInfo? = hit
+        while (n != null && !n.isClickable) n = n.parent
+        return n?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true
+    }
+
+    /** ① 内容描述含“发送”/“Send” */
+    private fun findSendByDesc(root: AccessibilityNodeInfo): AccessibilityNodeInfo? =
+        collectNodes(root).firstOrNull { n ->
+            SEND.any { w -> n.contentDescription?.toString()?.contains(w, ignoreCase = true) == true }
+        }
+
+    /** ② 文本等于“发送”/“Send” */
+    private fun findSendByText(root: AccessibilityNodeInfo): AccessibilityNodeInfo? =
+        SEND.firstNotNullOfOrNull { w ->
             root.findAccessibilityNodeInfosByText(w).firstOrNull { n ->
                 n.isVisibleToUser && n.isEnabled && !n.isEditable &&
                     listOf(n.text, n.contentDescription).any { it?.toString()?.trim().equals(w, ignoreCase = true) }
             }
-        } ?: return false
-        var n: AccessibilityNodeInfo? = hit
-        while (n != null && !n.isClickable) n = n.parent
-        return n?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true
+        }
+
+    /** ③ 输入框附近（上下 200px 内）的 ImageButton/ImageView，取离输入框最近的一个 */
+    private fun findSendNearInput(root: AccessibilityNodeInfo, input: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+        val r = Rect()
+        input?.getBoundsInScreen(r) ?: return null
+        val b = Rect()
+        var best: AccessibilityNodeInfo? = null
+        var bestScore = Int.MAX_VALUE
+        for (n in collectNodes(root)) {
+            val cls = n.className?.toString() ?: continue
+            if (cls != "android.widget.ImageButton" && cls != "android.widget.ImageView") continue
+            n.getBoundsInScreen(b)
+            val vGap = when {
+                b.top > r.bottom -> b.top - r.bottom
+                r.top > b.bottom -> r.top - b.bottom
+                else -> 0
+            }
+            if (vGap > 200) continue
+            val hGap = if (b.left >= r.right) b.left - r.right else if (b.right <= r.left) r.left - b.right else 0
+            val score = vGap * 10 + hGap
+            if (score < bestScore) {
+                bestScore = score
+                best = n
+            }
+        }
+        return best
+    }
+
+    /** 收集窗口树里可见、可用、不可编辑的节点（上限 500，避免大树耗时） */
+    private fun collectNodes(root: AccessibilityNodeInfo): List<AccessibilityNodeInfo> {
+        val out = mutableListOf<AccessibilityNodeInfo>()
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        var seen = 0
+        while (stack.isNotEmpty() && seen < 500) {
+            val n = stack.removeLast()
+            seen++
+            for (i in 0 until n.childCount) n.getChild(i)?.let { stack.add(it) }
+            if (n.isVisibleToUser && n.isEnabled && !n.isEditable) out.add(n)
+        }
+        return out
     }
 
     private fun editorSend(): Boolean {
@@ -208,6 +336,9 @@ class VoiceService : AccessibilityService() {
     companion object {
         var instance: VoiceService? = null
             private set
+        private const val TAG = "VoiceKey"
+        /** 小布全自动只在 Muse 里触发 */
+        private const val MUSE_PKG = "com.facebook.aura"
         private val SEND = listOf("发送", "Send")
         private val ACTIONS = setOf(EditorInfo.IME_ACTION_SEND, EditorInfo.IME_ACTION_GO, EditorInfo.IME_ACTION_SEARCH, EditorInfo.IME_ACTION_DONE)
 

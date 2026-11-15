@@ -48,6 +48,9 @@ class Session(private val svc: VoiceService) {
         private set
     var picking = false
         private set
+    /** 小布全自动：本次会话由 Muse 输入框聚焦触发，结束自动上屏并发送；手动开始的会话恒为 false */
+    var autoFlow = false
+        private set
     val active get() = rows.isNotEmpty()
     val recording get() = recorder != null
 
@@ -55,6 +58,14 @@ class Session(private val svc: VoiceService) {
 
     fun prewarm() {
         if (!active) channels().filter { it.ready && it.loggedIn }.forEach { Native.prewarm(it.id) }
+    }
+
+    /** 小布全自动：Muse 输入框聚焦时自动开始，走现有的点按路径（静音自动结束）。开始失败则不留自动标记 */
+    fun beginAuto() {
+        if (active || recording) return
+        autoFlow = true
+        tap()
+        if (!active && !recording) autoFlow = false
     }
 
     /** 点按：没在说就开始（静音自动结束），在录就结束，候选框开着就取消 */
@@ -209,6 +220,14 @@ class Session(private val svc: VoiceService) {
      */
     private fun advancePick() {
         if (!picking) return
+        // 小布全自动：不等用户按数字键选，有了第一条定稿就按列表顺序取最靠前的一条上屏并发送；
+        // 用户已动手（点选/换行/待选）或还在录音时不抢，避免打断说话和手动选择
+        if (autoFlow && !manual && !choosePending && !recording) {
+            rows.indexOfFirst { it.state == State.Final }.takeIf { it >= 0 }?.let {
+                choose(it, true)
+                return
+            }
+        }
         var waiting = rows.any { it.state == State.Listen || it.state == State.Wait }
         val finals = rows.count { it.state == State.Final }
         val canAdvance = choosePending || canAutoPick()
@@ -315,11 +334,19 @@ class Session(private val svc: VoiceService) {
     private fun single(row: Row) {
         val t = typer
         val node = target
+        val auto = autoFlow
         close()
         when {
-            row.state == State.Final -> if (t?.update(row.text) != true) Inject.insert(svc, node, row.text)
+            row.state == State.Final -> {
+                val ok = if (t?.update(row.text) != true) Inject.insert(svc, node, row.text) else true
+                if (auto) {
+                    // 自动流程：上屏成功且文字非空才发送；上屏失败只留字不崩溃，抑制到下一次失焦再聚焦
+                    if (ok && row.text.isNotEmpty()) svc.autoSend(node) else svc.suppressAutoFlow()
+                }
+            }
             typed -> {}
-            else -> svc.hud.error(if (row.text == "没有识别到内容") row.text else "识别失败：${row.text}")
+            // 自动流程里没识别到内容不弹错：用户本来就没想说话，只是打开了聊天框
+            else -> if (auto) svc.suppressAutoFlow() else svc.hud.error(if (row.text == "没有识别到内容") row.text else "识别失败：${row.text}")
         }
     }
 
@@ -340,9 +367,14 @@ class Session(private val svc: VoiceService) {
                 App.prefs.lastPick = r.ch
                 if (picking) App.prefs.countPick(r.ch)
                 val node = target
+                val auto = autoFlow
                 close()
                 val ok = Inject.insert(svc, node, r.text)
-                if (ok && send) svc.send(node)
+                if (ok && send) {
+                    if (auto) svc.autoSend(node) else svc.send(node)
+                } else if (auto) {
+                    svc.suppressAutoFlow()
+                }
             }
             State.Error -> svc.onSessionChanged()
         }
@@ -366,7 +398,9 @@ class Session(private val svc: VoiceService) {
         val t = typer
         val node = target
         val already = typed
+        val auto = autoFlow
         close()
+        if (auto && keep == null) svc.suppressAutoFlow()
         if (keep != null) {
             if (t?.update(keep) != true && !already) Inject.insert(svc, node, keep)
             svc.hud.info("$message，已保留已识别的文字")
@@ -378,6 +412,7 @@ class Session(private val svc: VoiceService) {
     private fun close() {
         cancelPickGrace()
         gen++
+        autoFlow = false
         recorder?.stop()
         recorder = null
         for (r in rows) {
