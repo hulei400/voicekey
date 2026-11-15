@@ -7,6 +7,7 @@ import android.media.AudioManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import android.view.KeyCharacterMap
@@ -36,6 +37,9 @@ class VoiceService : AccessibilityService() {
      */
     private var foregroundActivity: String? = null
     private var foregroundActivityPkg: String? = null
+    /** 1.13.8 Muse 语音自动播放：上次扫描时间（500ms 防抖）与已放过的播放按钮 bounds 集合 */
+    private var lastVoiceScanMs = 0L
+    private val playedVoiceBounds = LinkedHashSet<String>()
 
     /** 设置页录制长按组合：非空时接管按键，录完回调结果；null 表示取消 */
     var recorder: ((List<Int>?) -> Unit)? = null
@@ -70,6 +74,98 @@ class VoiceService : AccessibilityService() {
         main.removeCallbacks(check)
         main.postDelayed(check, 150)
         maybeAutoListenOverlay(e)
+        maybeAutoPlayVoice(e)
+    }
+
+    /**
+     * 1.13.8 Muse 聊天语音消息自动播放。开关 museVoiceAutoPlay 是唯一的门（默认关，
+     * 关着时直接返回、什么都不做）；只在 Muse 包里工作，无障碍服务只能看到前台窗口
+     * 的节点，Muse 不在前台时自然不触发，不用另加前台判断。
+     * 新消息出现（内容变化/滚动）时扫描一次，带 500ms 防抖；找到未播过的语音气泡
+     * 就点它的播放按钮。只认未播状态（内容描述恰好是“播放”，播放中大概率变“暂停”
+     * 就不认）；播完变回“播放”时靠已放集合不再重播；新气泡（bounds 不同）才再放。
+     * 输入框、发送箭头、悬浮栏那条路都不碰。
+     */
+    private fun maybeAutoPlayVoice(e: AccessibilityEvent) {
+        if (e.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED &&
+            e.eventType != AccessibilityEvent.TYPE_VIEW_SCROLLED
+        ) return
+        if (!App.prefs.museVoiceAutoPlay) return
+        if (foregroundPackage() != MUSE_PKG) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastVoiceScanMs < VOICE_SCAN_DEBOUNCE_MS) return
+        lastVoiceScanMs = now
+        val root = rootInActiveWindow ?: return
+        val play = findVoicePlayButton(root) ?: return
+        val key = voiceButtonKey(play)
+        if (key in playedVoiceBounds) return
+        if (play.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+            playedVoiceBounds.add(key)
+            while (playedVoiceBounds.size > VOICE_PLAYED_CAP) playedVoiceBounds.remove(playedVoiceBounds.first())
+            Log.d(TAG, "muse voice autoplay: clicked play button bounds=$key")
+        }
+    }
+
+    /**
+     * 找最下面一个语音气泡的播放按钮。语音三件套（2026-11-15 uiautomator dump
+     * 实测，Muse 聊天独有，链接卡片没有）：Button 内容描述“播放” + 同气泡里
+     * ProgressBar 内容描述“音频进度” + 时长 TextView（m:ss 格式，如 0:00）。
+     * 气泡本身不一定是 hatch-message-assistant-latest（最新文本消息占着它），
+     * 所以扫描全部助手气泡、取最下面那条；多条未播语音在屏上时取 top 最大的。
+     */
+    private fun findVoicePlayButton(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        var best: AccessibilityNodeInfo? = null
+        var bestTop = Int.MIN_VALUE
+        val b = Rect()
+        for (n in collectNodes(root)) {
+            if (n.className?.toString() != BUTTON_CLASS) continue
+            if (n.contentDescription?.toString()?.trim() != PLAY_DESC) continue
+            if (!isVoiceBubble(n)) continue
+            n.getBoundsInScreen(b)
+            if (b.top > bestTop) {
+                bestTop = b.top
+                best = n
+            }
+        }
+        return best
+    }
+
+    /** 该播放按钮所在的气泡里是否同时有“音频进度”进度条和 m:ss 时长文本 */
+    private fun isVoiceBubble(play: AccessibilityNodeInfo): Boolean {
+        var anc = play.parent
+        var depth = 0
+        while (anc != null && depth < 6) {
+            if (subtreeHasVoiceSignature(anc)) return true
+            anc = anc.parent
+            depth++
+        }
+        return false
+    }
+
+    /** 子树里是否同时有内容描述“音频进度”的 ProgressBar 和 m:ss 格式的 TextView */
+    private fun subtreeHasVoiceSignature(root: AccessibilityNodeInfo): Boolean {
+        var hasProgress = false
+        var hasDuration = false
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        var seen = 0
+        while (stack.isNotEmpty() && seen < 200) {
+            val n = stack.removeLast()
+            seen++
+            for (i in 0 until n.childCount) n.getChild(i)?.let { stack.add(it) }
+            val cls = n.className?.toString()
+            if (cls == PROGRESS_CLASS && n.contentDescription?.toString()?.trim() == PROGRESS_DESC) hasProgress = true
+            if (cls == TEXT_VIEW_CLASS && DURATION_RE.matches(n.text?.toString().orEmpty())) hasDuration = true
+            if (hasProgress && hasDuration) return true
+        }
+        return false
+    }
+
+    /** 已放集合的 key：播放按钮的屏幕 bounds；同一气泡播完变回“播放”时 bounds 不变，不再重播 */
+    private fun voiceButtonKey(play: AccessibilityNodeInfo): String {
+        val b = Rect()
+        play.getBoundsInScreen(b)
+        return b.toString()
     }
 
     /**
@@ -383,6 +479,15 @@ class VoiceService : AccessibilityService() {
         private const val OVERLAY_ACTIVITY = "HatchAssistOverlayActivity"
         /** 悬浮栏搜索框在无障碍层暴露的类名（小布模块 12:40 实测） */
         private const val EDIT_TEXT_CLASS = "android.widget.EditText"
+        /** 1.13.8 语音自动播放：播放按钮与进度条的类名/内容描述（2026-11-15 dump 实测的固定字面串） */
+        private const val BUTTON_CLASS = "android.widget.Button"
+        private const val PLAY_DESC = "播放"
+        private const val PROGRESS_CLASS = "android.widget.ProgressBar"
+        private const val PROGRESS_DESC = "音频进度"
+        private const val TEXT_VIEW_CLASS = "android.widget.TextView"
+        private val DURATION_RE = Regex("^\\d+:\\d{2}$")
+        private const val VOICE_SCAN_DEBOUNCE_MS = 500L
+        private const val VOICE_PLAYED_CAP = 100
         private val SEND = listOf("发送", "Send")
         private val ACTIONS = setOf(EditorInfo.IME_ACTION_SEND, EditorInfo.IME_ACTION_GO, EditorInfo.IME_ACTION_SEARCH, EditorInfo.IME_ACTION_DONE)
 

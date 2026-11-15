@@ -113,6 +113,11 @@ class Prefs(ctx: Context) {
         get() = sp.getBoolean("museOverlayInsert", true)
         set(v) = sp.edit().putBoolean("museOverlayInsert", v).apply()
 
+    /** Muse 聊天里语音消息自动播放（只在 Muse 里）：聊天里出现未播放的语音气泡时自动点播放按钮。默认关；开关是唯一的门，关着时什么都不做 */
+    var museVoiceAutoPlay: Boolean
+        get() = sp.getBoolean("museVoiceAutoPlay", false)
+        set(v) = sp.edit().putBoolean("museVoiceAutoPlay", v).apply()
+
     /** 上次自动检查更新的时间（毫秒），用于 12 小时节流 */
     var updateCheckedAt: Long
         get() = sp.getLong("updateCheckedAt", 0L)
