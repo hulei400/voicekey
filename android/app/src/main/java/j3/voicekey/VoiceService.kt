@@ -38,27 +38,36 @@ class VoiceService : AccessibilityService() {
     private var foregroundActivity: String? = null
     private var foregroundActivityPkg: String? = null
     /** 1.13.8 Muse 语音自动播放：上次扫描时间（500ms 防抖）。
-     * 1.13.10 起不再用任何集合当“已放”记号（bounds 随滚动变、序号跨窗口撞号）：
-     * 改成按窗口记语音气泡个数——个数增加了才说明来了新的一条，才点最下面那条；
-     * 个数没变就什么都不做，播完变回“播放”也不会重播。
+     * 1.13.10-1.13.12 一路试的都是“数可见气泡个数”：bounds 随滚动变、
+     * 序号跨窗口撞号、未播个数随播放状态震荡、全部个数自己抖（3↔2↔1）、
+     * 历史最大个数被视口容量卡死（新语音来一个、旧的就被顶出视口，个数
+     * 永远到不了 4）——可见个数是视口的属性，不是对话的属性，这条路走不通。
+     * 1.13.13：按文字认语音，不数个数。每条语音气泡正上方都有一段文字
+     * （消息文本转写，随滚动不变，2026-11-15 dump 实测：主聊天和悬浮栏
+     * 都是“文字在上、气泡在下”，文字底边离播放按钮顶边约 66-90px）——
+     * 用它当身份。按窗口记上次放过的那条的文字（lastPlayedTranscript）：
+     * 最下面那条的文字变了、并且列表已滑到底、并且按钮是“播放”，才点一次；
+     * 发文字消息、滚动、重组、播完变回“播放”都不会换文字，都不点。
      * key 是前台 Activity 类名（悬浮栏 HatchAssistOverlayActivity 和主聊天
      * AuraMainActivity 各记各的），切窗口不会互相干扰；某窗口第一次见时只记
-     * 个数、不点，避免把旧气泡当成新的放出来。
-     * 1.13.11：数的必须是对面“全部”气泡——1.13.10 只数未播（只认“播放”），
-     * 播着的（按钮变“暂停”）不算，个数随播放状态 0↔1 震荡，0→1 被误当成新消息，
-     * 同一条 53 秒里被点了 9 次。改成按钮“播放”或“暂停”都算，个数不再跟播放
-     * 状态走；点之前再看最下面那条按钮是不是“播放”（“暂停”就跳过）。
-     * 1.13.12：记的不是上次个数，而是该窗口见过的最大个数（高水位）——
-     * 1.13.11 数的是“当前这次扫描的无障碍树里可见几条”（Compose LazyColumn
-     * 只拼视口里的项），可见个数在列表滚动/重组时自己会抖（3↔2↔1）：发一条
-     * 文字消息、列表重排，个数先掉到 1、又弹回 3，上次个数被拉低后弹回就成了
-     * 一次“个数增加”，点了最下面那条旧语音。高水位只升不降，抖动弹回 3
-     * 不超过 3 就不点；真来新语音到 4（> 最大值）才点。 */
+     * 文字、不点，避免把旧气泡当成新的放出来。 */
     private var lastVoiceScanMs = 0L
-    private val maxVoiceCountByWindow = mutableMapOf<String, Int>()
+    /** 1.13.13 该窗口上次放过的语音的文字（身份）。 */
+    private val lastPlayedTranscriptByWindow = mutableMapOf<String, String>()
+    /** 1.13.13 上次扫描时该窗口可见的全部语音文字（新旧判断用：文字不在上一
+     * 次可见集合里，说明它刚进视口；滚动回旧语音时文字早在集合里，不点）。 */
+    private val lastScanTranscriptsByWindow = mutableMapOf<String, Set<String>>()
     /** 1.13.12 上一次确定的前台 Activity（取不到前台 Activity 时沿用它，别拿
      * "?" 当新窗口；从没确定过就跳过这次扫描）。 */
     private var lastKnownVoiceWindow: String? = null
+    /** 1.13.13 最近一次滚动事件（TYPE_VIEW_SCROLLED，在 Muse 包里才记）：
+     * 列表滑到底的判断。LazyColumn 滚动事件是否报真实总数（itemCount），
+     * 实现时没法在盒子上验——把它写进日志，真机上能从日志反推；拿不到
+     * 总数时走“文字是否刚进视口”的退路。 */
+    private var lastScrollToIndex = -1
+    private var lastScrollItemCount = -1
+    /** 1.13.13 最近一次内容变化事件的时间（elapsedRealtime，诊断用）。 */
+    private var lastContentChangeMs = 0L
 
     /** 设置页录制长按组合：非空时接管按键，录完回调结果；null 表示取消 */
     var recorder: ((List<Int>?) -> Unit)? = null
@@ -100,38 +109,41 @@ class VoiceService : AccessibilityService() {
      * 1.13.8 Muse 聊天语音消息自动播放。开关 museVoiceAutoPlay 是唯一的门（默认关，
      * 关着时直接返回、什么都不做）；只在 Muse 包里工作，无障碍服务只能看到前台窗口
      * 的节点，Muse 不在前台时自然不触发，不用另加前台判断。
-     * 新消息出现（内容变化/滚动）时扫描一次，带 500ms 防抖；只认未播状态（内容描述
-     * 恰好是“播放”，播放中大概率变“暂停”就不认）。
-     * 1.13.10：不再用 bounds/序号当“已放”记号——bounds 随聊天滚动变（1.13.8 重播），
-     * 序号跨窗口撞号（1.13.9：悬浮栏只露出 2 条、序号 0/1，主聊天早记过 0/1，已放
-     * 集合全局共用，悬浮栏里的 0/1 就被当成放过、跳过，悬浮栏里一直没放）。改成按
-     * 窗口数气泡个数：只有个数比上次增加了（说明来了新的一条），才点最下面那条；
-     * 个数没变就什么都不做，播完变回“播放”也不会重播；某窗口第一次见只记个数、
-     * 不点。输入框、发送箭头、悬浮栏那条路都不碰。
-     * 每次扫描记一行 vk-autoplay-trace.log（时间/窗口/个数/历史最大个数/动作与理由），
-     * Log.d 不进 logcat，决策不能再是黑盒。
-     * 1.13.11：数的必须是对面“全部”气泡——1.13.10 只数未播（只认“播放”按钮），
-     * 播着的按钮变“暂停”不算，个数随播放状态 0↔1 震荡（播完变回“播放”又回到 1），
-     * 0→1 被误当成新消息，同一条 53 秒里被点了 9 次。改成按钮“播放”或“暂停”
-     * 都算一个气泡，个数不再跟播放状态走；点之前再看最下面那条按钮是不是“播放”
-     * （“暂停”就跳过）。进度控件按 content-desc“音频进度”认（未播时是
-     * ProgressBar、播着时是 SeekBar，别写死类名）。
-     * 1.13.12：记的不是上次个数，而是该窗口的“历史最大个数”（高水位）——
-     * 1.13.11 数的是当前扫描里可见几条，可见个数在列表滚动/重组时自己抖
-     * （3↔2↔1）：发一条文字消息、列表重排，个数先掉到 1、又弹回 3，上次个数
-     * 被拉低后弹回就成了“个数增加”，点了最下面那条旧语音。高水位只升不降，
-     * 只有超过历史最大才当成新语音。取不到前台 Activity 时沿用上一次确定的
-     * 窗口；从来没确定过就跳过这次扫描、别点。
+     * 新消息出现（内容变化/滚动）时扫描一次，带 500ms 防抖。输入框、发送箭头、
+     * 悬浮栏那条路都不碰。
+     * 每次扫描记一行 vk-autoplay-trace.log（时间/窗口/可见个数/动作与理由），
+     * Log.d 不进 logcat，决策不能再是黑盒。日志里只记文字的长度 + 前 4 字，
+     * 不记全文。
+     * 1.13.13：不再数个数——1.13.10-1.13.12 数可见个数栽了五回（bounds 随滚动变、
+     * 序号跨窗口撞号、未播个数随播放状态震荡、全部个数自己抖 3↔2↔1、高水位被
+     * 视口容量 3 卡死、新语音再也超不过去）。改成按文字认语音：每条语音气泡
+     * 正上方都有一段文字（消息文本转写，随滚动不变；主聊天和悬浮栏都一样），
+     * 拿它当身份。按窗口记上次放过的文字（lastPlayedTranscript）；每次扫描
+     * 找最下面那条语音 + 它的文字，文字变了、并且列表已滑到底（滚动事件
+     * toIndex >= itemCount - 1；拿不到总数时退路是“文字刚进视口”——
+     * 这条文字不在上次扫描可见的文字集合里）、并且按钮是“播放”，才点一次。
+     * 文字没变（发文字消息、滚动、重组、播完变回“播放”）就不点。某窗口
+     * 第一次见只记文字、不点。找不到文字的气泡跳过不点、记跳过理由。
+     * 两条语音文字一字不差会撞号（第二条不放）——极少见，且是漏放不是重播。
      */
     private fun maybeAutoPlayVoice(e: AccessibilityEvent) {
+        // 1.13.13：先记滚动/内容变化信号（不管这次事件会不会触发扫描），滑到底
+        // 的判断和退路都需要它们。只记 Muse 包里的事件，别被别的 App 冲掉。
+        val now = SystemClock.elapsedRealtime()
+        if (e.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED && e.packageName?.toString() == MUSE_PKG) {
+            lastScrollToIndex = e.toIndex
+            lastScrollItemCount = e.itemCount
+        }
+        if (e.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED && e.packageName?.toString() == MUSE_PKG) {
+            lastContentChangeMs = now
+        }
         if (e.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED &&
             e.eventType != AccessibilityEvent.TYPE_VIEW_SCROLLED
         ) return
-        val now = SystemClock.elapsedRealtime()
         if (now - lastVoiceScanMs < VOICE_SCAN_DEBOUNCE_MS) return
         lastVoiceScanMs = now
         // 1.13.12：取不到前台 Activity 时沿用上一次确定的窗口，别拿 "?" 当新窗口
-        // （否则 max 会被拆到 "?" 和真窗口两个 key 下）；从来没确定过就跳过这次扫描。
+        // （否则状态会被拆到 "?" 和真窗口两个 key 下）；从来没确定过就跳过这次扫描。
         val activity = foregroundActivity ?: lastKnownVoiceWindow
         if (activity == null) {
             logAutoplay("?", -1, -1, "skip no-activity")
@@ -152,34 +164,70 @@ class VoiceService : AccessibilityService() {
             logAutoplay(activity, -1, -1, "skip no-root")
             return
         }
-        val plays = findVoiceBubbleButtons(root)
-        val count = plays.size
-        // 1.13.12 高水位：只升不降。可见个数抖动（3↔2↔1）不会拉低它，弹回 3
-        // 不超过 3 就不点；真来新语音到 4（> 最大值）才点最下面那条。
-        val max = maxVoiceCountByWindow[activity]
-        if (max == null) {
-            maxVoiceCountByWindow[activity] = count
-            logAutoplay(activity, count, -1, "baseline first-scan-in-window")
+        val bubbles = findVoiceBubbles(root)
+        val count = bubbles.size
+        // 退路用的上一轮可见文字集合：先读出来，再记这一轮的。
+        val prevVisible = lastScanTranscriptsByWindow[activity]
+        lastScanTranscriptsByWindow[activity] = bubbles.mapNotNull { it.second }.toSet()
+        if (bubbles.isEmpty()) {
+            logAutoplay(activity, count, -1, "skip no-voice-bubbles")
             return
         }
-        if (count <= max) {
-            logAutoplay(activity, count, max, "skip count-not-increased")
+        val bottom = bubbles.last()
+        val transcript = bottom.second
+        if (transcript == null) {
+            logAutoplay(activity, count, -1, "skip no-transcript")
             return
         }
-        maxVoiceCountByWindow[activity] = count
-        val play = plays[count - 1]
+        val tag = transcriptTag(transcript)
+        // 1.13.13 按文字认语音：第一次见某窗口只记文字、不点。
+        val lastPlayed = lastPlayedTranscriptByWindow[activity]
+        if (lastPlayed == null) {
+            lastPlayedTranscriptByWindow[activity] = transcript
+            logAutoplay(activity, count, -1, "baseline first-scan-in-window $tag")
+            return
+        }
+        if (transcript == lastPlayed) {
+            logAutoplay(activity, count, -1, "skip same-transcript $tag")
+            return
+        }
+        // 滑到底的判断：滚动事件 toIndex >= itemCount - 1。LazyColumn 滚动事件
+        // 是否报真实总数（itemCount）实现时没法在盒子上验——拿不到就走退路。
+        val atBottom: Boolean? =
+            if (lastScrollItemCount > 0 && lastScrollToIndex >= 0) lastScrollToIndex >= lastScrollItemCount - 1 else null
+        if (atBottom == false) {
+            logAutoplay(activity, count, -1, "skip not-at-bottom to=$lastScrollToIndex total=$lastScrollItemCount $tag")
+            return
+        }
+        // 退路：拿不到总数时，光靠“文字变了”还不够——用户往上翻、把一条旧语音翻
+        // 到视口底部时文字也会变。要求这条文字不在上次扫描可见的集合里（刚进
+        // 视口的新语音才满足）；拿得到总数且已滑到底时不用这道闸。
+        if (atBottom == null && prevVisible != null && transcript in prevVisible) {
+            logAutoplay(activity, count, -1, "skip transcript-already-visible $tag")
+            return
+        }
+        val play = bottom.first
         if (play.contentDescription?.toString()?.trim() != PLAY_DESC) {
-            logAutoplay(activity, count, max, "skip bottom-most-already-playing")
+            // 已经在播了（用户手动点了、或之前放过）：记成已放，播完变回“播放”
+            // 后别再点它一遍。
+            lastPlayedTranscriptByWindow[activity] = transcript
+            logAutoplay(activity, count, -1, "skip bottom-most-already-playing $tag")
             return
         }
         val clicked = play.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        logAutoplay(activity, count, max, "click bottom-most clicked=$clicked")
-        if (clicked) Log.d(TAG, "muse voice autoplay: clicked play button count=$count max=$max activity=$activity")
+        if (clicked) lastPlayedTranscriptByWindow[activity] = transcript
+        logAutoplay(activity, count, -1, "click bottom-most clicked=$clicked atBottom=$atBottom $tag")
+        if (clicked) Log.d(TAG, "muse voice autoplay: clicked play button $tag activity=$activity")
     }
+
+    /** 1.13.13 日志用标签：只记文字长度 + 前 4 字，不记全文。 */
+    private fun transcriptTag(t: String): String =
+        "len=${t.length} head=${t.take(4).replace('\n', ' ').replace('\r', ' ')}"
 
     /** 1.13.10 自动播放文件日志：Log.d 不进 logcat，决策写文件（VoiceKey files 目录的
      * vk-autoplay-trace.log，和 vk-session-trace.log 分开），每次扫描一行——时间、
-     * 窗口、语音气泡数、历史最大个数、动作与跳过理由。下次再报“没放”直接读这个日志定。 */
+     * 窗口、可见语音气泡数、动作与跳过理由（1.13.13 起决策看文字不是个数，只记
+     * 文字长度 + 前 4 字，不记全文）。下次再报“没放”直接读这个日志定。 */
     private fun logAutoplay(activity: String, count: Int, prev: Int, msg: String) {
         try {
             val f = java.io.File(filesDir, "vk-autoplay-trace.log")
@@ -191,29 +239,50 @@ class VoiceService : AccessibilityService() {
     }
 
     /**
-     * 找全部语音气泡的播放/暂停按钮，按从上到下排好（最下面那条在最后）。
+     * 找全部语音气泡（播放/暂停按钮 + 每条正上方的文字转写），按从上到下排好
+     * （最下面那条在最后），返回 (按钮, 文字?)——文字找不到时为 null。
      * 语音三件套（2026-11-15 uiautomator dump 实测，Muse 聊天独有，链接卡片没有）：
      * Button 内容描述“播放”或“暂停” + 同气泡里进度控件内容描述“音频进度” +
      * 时长 TextView（m:ss 格式，如 0:00）。气泡本身不一定是
      * hatch-message-assistant-latest（最新文本消息占着它），所以扫描全部助手气泡；
      * 多条语音在屏上时取最下面那条。
-     * 1.13.10 起返回的列表只用来数个数和取最下面那条，不再用序号/bounds 当 key。
      * 1.13.11：按钮“播放”和“暂停”都算——只数未播的（只认“播放”）会随播放状态
      * 震荡（播着变“暂停”不算、播完变回“播放”又算，0→1 被误当成新消息，同一条
      * 53 秒被点 9 次）。数全部气泡，个数才不跟播放状态走。
+     * 1.13.13：每条气泡正上方都有一段文字（消息文本转写，随滚动不变；主聊天
+     * 和悬浮栏都一样，文字底边离播放按钮顶边约 66-90px）。文字是最靠近按钮
+     * 上方的 TextView（助手文字左对齐 x≈96-144，用户文字右对齐 x≥354，
+     * 所以只认左边缘 <= 300 的；时长 0:00、输入框提示、标题都不在候选里）。
      */
-    private fun findVoiceBubbleButtons(root: AccessibilityNodeInfo): List<AccessibilityNodeInfo> {
-        val found = mutableListOf<Pair<AccessibilityNodeInfo, Int>>()
+    private fun findVoiceBubbles(root: AccessibilityNodeInfo): List<Pair<AccessibilityNodeInfo, String?>> {
+        val nodes = collectNodes(root)
         val b = Rect()
-        for (n in collectNodes(root)) {
+        // 候选文字：非空 TextView，去掉时长（m:ss）、只认左对齐的助手文字。
+        val texts = nodes.mapNotNull { n ->
+            if (n.className?.toString() != TEXT_VIEW_CLASS) return@mapNotNull null
+            val t = n.text?.toString()?.trim().orEmpty()
+            if (t.isEmpty() || DURATION_RE.matches(t)) return@mapNotNull null
+            n.getBoundsInScreen(b)
+            if (b.left > TRANSCRIPT_LEFT_MAX) return@mapNotNull null
+            Triple(t, b.bottom, b.left)
+        }
+        val found = mutableListOf<Triple<AccessibilityNodeInfo, String?, Int>>()
+        for (n in nodes) {
             if (n.className?.toString() != BUTTON_CLASS) continue
             val desc = n.contentDescription?.toString()?.trim()
             if (desc != PLAY_DESC && desc != PAUSE_DESC) continue
             if (!isVoiceBubble(n)) continue
             n.getBoundsInScreen(b)
-            found.add(n to b.top)
+            val top = b.top
+            // 文字：最靠近按钮上方的那段（底边在按钮顶边之上、且离得近），
+            // 找不到就当没有（上层跳过不点）。
+            val transcript = texts
+                .filter { it.second <= top && top - it.second <= TRANSCRIPT_MAX_GAP }
+                .maxByOrNull { it.second }
+                ?.first
+            found.add(Triple(n, transcript, top))
         }
-        return found.sortedBy { it.second }.map { it.first }
+        return found.sortedBy { it.third }.map { it.first to it.second }
     }
 
     /** 该播放/暂停按钮所在的气泡里是否同时有“音频进度”进度控件和 m:ss 时长文本 */
@@ -569,6 +638,10 @@ class VoiceService : AccessibilityService() {
         private const val TEXT_VIEW_CLASS = "android.widget.TextView"
         private val DURATION_RE = Regex("^\\d+:\\d{2}$")
         private const val VOICE_SCAN_DEBOUNCE_MS = 500L
+        /** 1.13.13 转写文字离播放按钮顶边的最大距离（px；实测约 66-90px，留足余量）。 */
+        private const val TRANSCRIPT_MAX_GAP = 500
+        /** 1.13.13 转写文字的左边缘上限（px；助手文字 x≈96-144，用户文字右对齐 x≥354）。 */
+        private const val TRANSCRIPT_LEFT_MAX = 300
         private val SEND = listOf("发送", "Send")
         private val ACTIONS = setOf(EditorInfo.IME_ACTION_SEND, EditorInfo.IME_ACTION_GO, EditorInfo.IME_ACTION_SEARCH, EditorInfo.IME_ACTION_DONE)
 
