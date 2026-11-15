@@ -7,6 +7,13 @@ import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Toast
 import org.json.JSONObject
 
+/** 1.13.6 悬浮栏自动触发“稳定 partial 先上屏”：停录后等多久再看 partial（让飞行中的 partial 落定） */
+private const val PARTIAL_SETTLE_MS = 500L
+/** 文字多久没变算“稳定整句” */
+private const val PARTIAL_STABLE_MS = 400L
+/** 没找到稳定文字时多久再看一次 */
+private const val PARTIAL_RECHECK_MS = 300L
+
 /** 一次说话：录音 → 一个或多个渠道识别 → 写入输入框。状态只在主线程读写 */
 class Session(private val svc: VoiceService) {
     enum class State { Listen, Wait, Final, Error }
@@ -16,6 +23,8 @@ class Session(private val svc: VoiceService) {
         var state = State.Listen
         var ms: Long? = null
         var handle = 0L
+        /** 1.13.6：text 上次真正变化的时间（elapsedRealtime）；悬浮栏“稳定 partial 先上屏”用它判稳 */
+        var lastTextMs: Long = 0L
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -36,6 +45,8 @@ class Session(private val svc: VoiceService) {
     private var selectionTiming = JevSelectionTiming()
     /** 用户已动手选过（点选/换行），Jev 不再介入 */
     private var manual = false
+    /** 1.13.6 悬浮栏自动触发“稳定 partial 先上屏”的定时器；close() 时取消 */
+    private var partialRun: Runnable? = null
 
     var rows: List<Row> = emptyList()
         private set
@@ -169,6 +180,9 @@ class Session(private val svc: VoiceService) {
             }
         }, 15_000)
         if (picking) advancePick()
+        // 1.13.6 悬浮栏自动触发：停录后不等 Final（双通道二次识别慢），
+        // 用已稳定的流式整句先上屏；手动会话、手动点选不走这条
+        if (overlayAuto && overlayFlow && !choosePending && !manual) schedulePartialCheck()
         svc.onSessionChanged()
     }
 
@@ -182,11 +196,11 @@ class Session(private val svc: VoiceService) {
                     heard = true
                     lastVoice = SystemClock.elapsedRealtime()
                 }
-                row.text = text
+                setRowText(row, text)
                 if (typer?.update(text) == true) typed = true
             }
             Native.FINAL -> {
-                if (text.isNotEmpty()) row.text = text
+                if (text.isNotEmpty()) setRowText(row, text)
                 if (row.text.isEmpty()) {
                     row.text = "没有识别到内容"
                     row.state = State.Error
@@ -197,7 +211,7 @@ class Session(private val svc: VoiceService) {
             }
             else -> {
                 if (row.text.isEmpty()) {
-                    row.text = text
+                    setRowText(row, text)
                     row.state = State.Error
                 } else {
                     row.state = State.Final
@@ -272,6 +286,76 @@ class Session(private val svc: VoiceService) {
     private fun cancelPickGrace() {
         pickGrace?.let { main.removeCallbacks(it) }
         pickGrace = null
+    }
+
+    private fun cancelPartialCheck() {
+        partialRun?.let { main.removeCallbacks(it) }
+        partialRun = null
+    }
+
+    /** 文字真的变了才更新，并记下变化时间（1.13.6 悬浮栏“稳定 partial 先上屏”用它判稳） */
+    private fun setRowText(row: Row, text: String) {
+        if (text != row.text) {
+            row.text = text
+            row.lastTextMs = SystemClock.elapsedRealtime()
+        }
+    }
+
+    /**
+     * 1.13.6 悬浮栏自动触发“第一个有效结果就上屏”：
+     * 不等 Final——Final 要等 FinishSession 后服务端的二次识别（豆包等开着 twopass），
+     * 实测要约 5 秒；流式 partial 在停录时其实已经是整句（用户说完了，不会再长出来），
+     * 只要停录后这路的文字稳定了一会儿，就先上屏，不等其余渠道和 Final。
+     * “有效整句”判定：已停录 + 文字非空 + 在 PARTIAL_STABLE_MS 内没变过（见 commitFirstStablePartial）。
+     * 只在自动触发的悬浮栏会话里跑（overlayAuto），手动触发、手动点选都不受影响；
+     * 找不到稳定文字时什么都不做，Final 那条快路（advancePick）仍是后备。
+     */
+    private fun schedulePartialCheck() {
+        if (!active || !overlayAuto || !overlayFlow || manual || choosePending || recording) return
+        cancelPartialCheck()
+        val g = gen
+        val run = object : Runnable {
+            override fun run() {
+                if (g != gen) return
+                partialRun = null
+                if (commitFirstStablePartial()) return
+                // 还没有可上屏的稳定文字：只要还有路在识别，就再等一轮看看；
+                // Final 到了会走快路、会话结束（close）会清掉这个定时器
+                if (active && overlayAuto && overlayFlow && !manual && !choosePending && !recording &&
+                    rows.any { it.state == State.Listen || it.state == State.Wait }) {
+                    partialRun = this
+                    main.postDelayed(this, PARTIAL_RECHECK_MS)
+                }
+            }
+        }
+        partialRun = run
+        main.postDelayed(run, PARTIAL_SETTLE_MS)
+    }
+
+    /**
+     * 找第一路（按 pickCount 排过的列表顺序）非空且稳定的文字上屏。
+     * 上屏路径和 Final 快路一致：先 close（丢掉晚到的结果、收起面板、抑制下次自动触发），
+     * 再走 insertForOverlay（它自带“框里已有字就不写”的上屏前检查兜底）。
+     * 返回是否真的上屏了。
+     */
+    private fun commitFirstStablePartial(): Boolean {
+        if (!active || !overlayAuto || !overlayFlow || manual || choosePending || recording) return false
+        val now = SystemClock.elapsedRealtime()
+        // 至少等 PARTIAL_SETTLE_MS，让停录前后飞行中的 partial 落定
+        if (now - releasedAt < PARTIAL_SETTLE_MS) return false
+        val idx = rows.indexOfFirst { r ->
+            r.state != State.Error && r.text.isNotEmpty() &&
+                now - r.lastTextMs >= PARTIAL_STABLE_MS
+        }
+        if (idx < 0) return false
+        val row = rows[idx]
+        val node = target
+        val text = row.text
+        App.prefs.lastPick = row.ch
+        if (picking) App.prefs.countPick(row.ch)
+        close()
+        insertForOverlay(node, text)
+        return true
     }
 
     private fun finishSlowRows() {
@@ -424,6 +508,7 @@ class Session(private val svc: VoiceService) {
 
     private fun close() {
         cancelPickGrace()
+        cancelPartialCheck()
         gen++
         // 悬浮栏自动触发的会话结束：抑制再触发，直到框失焦或悬浮栏关掉再重新聚焦
         if (overlayAuto) svc.suppressOverlayAuto()
