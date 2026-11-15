@@ -319,19 +319,10 @@ class VoiceService : AccessibilityService() {
             logAutoplay(foregroundActivity ?: "?", -1, -1, "skip not-muse pkg=$pkg")
             return
         }
-        // 可选补学 Activity：foregroundActivity 为 null 时，从 getWindows()
-        // 取当前聚焦窗口根节点的类名——类名含 "Activity" 时才认（根节点一般
-        // 是 View 类，认不到就走包名退路，别硬等窗口切换事件）。
-        if (foregroundActivity == null) {
-            try {
-                val cls = windows.firstOrNull { it.isFocused }?.root?.className?.toString()
-                if (cls != null && cls.contains("Activity")) {
-                    foregroundActivity = cls
-                    foregroundActivityPkg = pkg
-                }
-            } catch (_: Exception) {
-            }
-        }
+        // 1.13.19：删掉死的 getWindows() 补学——它读窗口根节点的 View 类名
+        // （如 FrameLayout/AndroidComposeView），永远满足不了 contains("Activity")，
+        // 从一开始就没法工作；自动播放本来就走包名退路（下面 activity 取不到时
+        // 用 lastKnownVoiceWindow 或包名），删了行为不变。
         val activity = foregroundActivity ?: lastKnownVoiceWindow ?: MUSE_PKG
         lastKnownVoiceWindow = activity
         saveLastWindow(activity)
@@ -595,10 +586,10 @@ class VoiceService : AccessibilityService() {
         }
     }
 
-    /** 1.13.18 触发决策状态行（节流 1 秒）：悬浮栏在前台时写清当时每个条件
-     * 的值 + 拦住触发的理由（或 trigger）。只在悬浮栏在前台时记，别的
-     * App 里不记。 */
-    private fun logTriggerState(source: String, input: AccessibilityNodeInfo?, matched: Boolean, blockReason: String) {
+    /** 1.13.18 触发决策状态行（节流 1 秒）：写清当时每个条件的值 + 拦住触发
+     * 的理由（或 trigger）。事件路径在认出框时记；轮询在 Muse 包里时记，
+     * 1.13.19 起门前就记（门没过也记一行，写清门的状态），别的 App 里不记。 */
+    private fun logTriggerState(source: String, input: AccessibilityNodeInfo?, matched: Boolean, blockReason: String, extra: String = "") {
         val now = SystemClock.elapsedRealtime()
         if (now - lastTrigLogMs < 1000L) return
         lastTrigLogMs = now
@@ -614,7 +605,7 @@ class VoiceService : AccessibilityService() {
         val textEmpty = try { input?.let { nodeTextEmpty(it) } } catch (_: Exception) { "?" }
         val active = if (::session.isInitialized) session.active.toString() else "?"
         val recording = if (::session.isInitialized) session.recording.toString() else "?"
-        logTrigger(source, "activity=$foregroundActivity pkg=$foregroundActivityPkg input=$inputDesc matched=$matched textEmpty=$textEmpty suppressed=$overlayAutoSuppressed switch=${App.prefs.museOverlayInsert} active=$active recording=$recording $blockReason")
+        logTrigger(source, "activity=$foregroundActivity pkg=$foregroundActivityPkg input=$inputDesc matched=$matched textEmpty=$textEmpty suppressed=$overlayAutoSuppressed switch=${App.prefs.museOverlayInsert} active=$active recording=$recording $blockReason${if (extra.isEmpty()) "" else " $extra"}")
     }
 
     /** 自动触发的会话结束（上屏/失败/超时）后抑制再触发，直到框失焦或悬浮栏关掉 */
@@ -652,30 +643,27 @@ class VoiceService : AccessibilityService() {
      * 悬浮栏不在前台时清抑制（安全网：窗口切换事件漏了，轮询 150ms 后也能
      * 补上）；只在“确实知道前台不是悬浮栏”时清，foregroundActivity 为 null
      * 时无法判断，不清。
+     * 1.13.19：触发不再硬依赖 foregroundActivity——17:44:34 的诊断钉死它一直
+     * 是 stale 的 AuraMainActivity，从没变成 HatchAssistOverlayActivity，
+     * 轮询和事件路径全被堵死。Activity 能取到且含 OVERLAY_ACTIVITY 时仍优先
+     * 用它；取不到或不对时，isMuseOverlaySearchBox 里的节点属性 + IME 动作 +
+     * 位置兜底认框，认出就触发，不再让一次学不到 Activity 就把整条链杀死。
+     * 日志也挪到门前面：1.13.18 的 [POLL] 是零行，因为 logTriggerState 在
+     * if (!overlayFg) return 之后，门没过就根本没跑到；现在先记评估行（只在
+     * Muse 包里记，别的 App 不记），再决定返回还是触发。死掉的 getWindows()
+     * 兜底删了：它读窗口根节点的 View 类名，永远满足不了 contains("Activity")，
+     * 从一开始就没法工作。
      */
     private fun maybeAutoListenOverlayPoll() {
         if (!::session.isInitialized) return
         if (!App.prefs.museOverlayInsert) return
         if (session.active || session.recording) return
-        // foregroundActivity 可能为 null（服务重连后一直停在同一个 Activity
-        // 里没切换）：像 maybeAutoPlayVoice 那样从 getWindows() 补学一次。
-        if (foregroundActivity == null) {
-            try {
-                val cls = windows.firstOrNull { it.isFocused }?.root?.className?.toString()
-                if (cls != null && cls.contains("Activity")) {
-                    foregroundActivity = cls
-                    foregroundActivityPkg = foregroundPackage()
-                }
-            } catch (_: Exception) {
-            }
-        }
-        // 悬浮栏在前台的判断要看 Activity，不只看包名——主聊天也在同一个包里。
-        val overlayFg = isMuseForeground() && foregroundActivity?.contains(OVERLAY_ACTIVITY) == true
-        if (!overlayFg) {
-            val knownNotOverlay = (foregroundActivity != null && !foregroundActivity!!.contains(OVERLAY_ACTIVITY)) || !isMuseForeground()
-            if (knownNotOverlay) clearSuppression("not-foreground")
-            return
-        }
+        // 悬浮栏在前台的判断：Activity 能取到且是悬浮栏时优先用它；取不到或
+        // 不对时不直接判死——下面 matched 里的兜底（节点属性 + IME 动作 +
+        // 位置）会再认一次。主聊天也在同一个包里，只看包名不够。
+        val museFg = isMuseForeground()
+        val activityKnownOverlay = foregroundActivity?.contains(OVERLAY_ACTIVITY) == true
+        val overlayFg = museFg && activityKnownOverlay
         val input = focusedInput()
         val matched = input != null && isMuseOverlaySearchBox(input)
         val action = focusedEditorAction()
@@ -687,7 +675,14 @@ class VoiceService : AccessibilityService() {
             !nodeTextEmpty(input) -> "blocked text-not-empty"
             else -> "trigger"
         }
-        logTriggerState("POLL", input, matched, blockReason)
+        // 1.13.19：日志挪到门前面——只在 Muse 包里记（节流 1 秒），别的 App 不记；
+        // 门过了沿用原来的行，门没过也记一行，写清门的状态（museFg/activity/pkg）。
+        if (museFg) logTriggerState("POLL", input, matched, blockReason, "museFg=$museFg")
+        if (!overlayFg && !matched) {
+            val knownNotOverlay = (foregroundActivity != null && !activityKnownOverlay) || !museFg
+            if (knownNotOverlay) clearSuppression("not-foreground")
+            return
+        }
         if (overlayAutoSuppressed) return
         if (input == null) return
         if (!matched) return
@@ -730,14 +725,45 @@ class VoiceService : AccessibilityService() {
      * 日志里，方便核对），不再是必要条件——实测这个框的 a11y 节点 inputType=0、hint 为空，
      * 1.13.4 那两条信号永远匹配不上，自动触发根本启动不了。
      * 1.13.4 起只用来选上屏路径（手动触发）与自动触发的认框，不再拒绝启动。
+     * 1.13.19：Activity 取不到/学错时走兜底（节点属性 + IME 动作 + 位置，
+     * 见 isOverlaySearchBoxByFallback），不再直接判死。
      */
     fun isMuseOverlaySearchBox(node: AccessibilityNodeInfo): Boolean {
         if (!node.isEditable || !node.isVisibleToUser) return false
         if (node.packageName?.toString() != MUSE_PKG) return false
         if (node.className?.toString() != EDIT_TEXT_CLASS) return false
-        val activity = foregroundActivity ?: return false
-        if (foregroundActivityPkg != MUSE_PKG) return false
-        return activity.contains(OVERLAY_ACTIVITY)
+        val activity = foregroundActivity
+        if (foregroundActivityPkg == MUSE_PKG && activity != null && activity.contains(OVERLAY_ACTIVITY)) return true
+        // 1.13.19：Activity 取不到或学错了（stale 的 AuraMainActivity）时不再
+        // 直接判死，走节点属性 + IME 动作 + 位置兜底（见 isOverlaySearchBoxByFallback）。
+        // 1.13.18 的教训：foregroundActivity 只靠 TYPE_WINDOW_STATE_CHANGED
+        // 事件学，悬浮栏出现时这个事件要么没到、要么类名不含 "Activity"，Activity
+        // 一直停在之前的主聊天，事件路径和轮询全被堵死。
+        return isOverlaySearchBoxByFallback(node, focusedEditorAction())
+    }
+
+    /**
+     * 1.13.19 悬浮栏搜索框兜底识别：foregroundActivity 学不到/学错时用。
+     * 条件（缺一不可）：
+     * ① IME 动作不是 SEND——聊天输入框恒为 SEND，悬浮栏框不是；
+     * ② bounds 落在悬浮栏搜索框的已知区域：键盘收起 Rect(318,2166-882,2310)，
+     *    键盘弹起约 Rect(318,1263-882,1407)——左右边固定（318/882）、高度约 144，
+     *    top 在两者之间（含键盘动画中）。调用方已查过包名/EditText/可编辑/可见。
+     * 注意：IME 动作在输入法未接通时返回 -1（不是 SEND），单靠它会把主聊天框
+     * 误认成悬浮栏框，所以必须和 bounds 一起用。
+     */
+    private fun isOverlaySearchBoxByFallback(node: AccessibilityNodeInfo, action: Int): Boolean {
+        if (action == EditorInfo.IME_ACTION_SEND) return false
+        val b = Rect()
+        try {
+            node.getBoundsInScreen(b)
+        } catch (_: Exception) {
+            return false
+        }
+        if (b.left !in 300..336 || b.right !in 864..900) return false
+        if (b.height() !in 120..170) return false
+        if (b.top !in 1200..2200) return false
+        return true
     }
 
     /** 当前聚焦的编辑框在输入法侧的动作；未聚焦或无输入连接时返回 -1 */
