@@ -70,17 +70,28 @@ class VoiceService : AccessibilityService() {
      * 长度 <4 或命中已知 UI 标签（“消息”）的文字不点——气泡在视口边缘、真
      * 文字被滑出视野时查找会抓附近 UI 文本当身份（len=2 的“消息”被点 8 次）。
      * 残留缺口：一条旧语音以前从没露过脸，往上滑第一次翻出来时可能还是会
-     * 放一次，放过就记住了，以后再滑到也不放（只看视口的固有限制，接受）。 */
+     * 放一次，放过就记住了，以后再滑到也不放（只看视口的固有限制，接受）。
+     * 1.13.16：两个集合按窗口分是错的——悬浮栏和主聊天显示的是同一段对话，
+     * 同一条语音在两个窗口里是同一条消息。日志确认：悬浮栏 16:09:22/47/56
+     * 点了 len=43 的“收到了，”三条，主聊天 16:10:08/09 又点了两条 len=43
+     * 的“收到了，”；xml 确认集合按窗口键（played./seen. + Activity 类名），
+     * 悬浮栏放过的 6 条里有 4 条不在主聊天的 played 里。改成全局共用：不管
+     * 在哪个窗口放过/见过，都只放一次；升级时把各窗口的旧集合全并进全局，
+     * 再删按窗口的旧键；首次扫描基线也改成全局的（两个全局集合都空才只记
+     * 不点）。lastWindow 只留作日志/诊断。 */
     private var lastVoiceScanMs = 0L
     /** 1.13.14 自动播放状态持久化（SharedPreferences “voice_autoplay”）。 */
     private val autoplayPrefs by lazy { getSharedPreferences("voice_autoplay", Context.MODE_PRIVATE) }
-    /** 1.13.15 该窗口点过（放过）的语音文字身份（SHA-256 前 16 位），持久化。
-     * LinkedHashSet 保插入顺序，封顶 AUTOPLAY_SET_CAP 条、先进先出。 */
-    private val playedTranscriptsByWindow = mutableMapOf<String, LinkedHashSet<String>>()
-    /** 1.13.15 该窗口以前任何一轮扫描里露过脸的语音文字身份（SHA-256 前 16 位），
-     * 持久化。每次扫描把本轮可见的全部文字都加进来；一条旧语音只要以前露过
-     * 脸，往上滑再见到它也不会点——不管视口怎么抖、不管用户怎么滑。 */
-    private val seenTranscriptsByWindow = mutableMapOf<String, LinkedHashSet<String>>()
+    /** 1.13.16 点过（放过）的语音文字身份（SHA-256 前 16 位），全局共用、
+     * 持久化。LinkedHashSet 保插入顺序，封顶 AUTOPLAY_SET_CAP 条、先进先出。
+     * 1.13.15 是按窗口分的（主聊天和悬浮栏各记各的），结果悬浮栏里放过的
+     * 回到主聊天又放一次——同一条语音在两个窗口里是同一条消息，不该按窗
+     * 口分。 */
+    private val playedTranscripts = LinkedHashSet<String>()
+    /** 1.13.16 以前任何一轮扫描里露过脸的语音文字身份（SHA-256 前 16 位），
+     * 全局共用、持久化。每次扫描把本轮可见的全部文字都加进来；一条旧语音
+     * 只要以前在任何窗口露过脸，换窗口再见到它也不会点。 */
+    private val seenTranscripts = LinkedHashSet<String>()
     /** 1.13.12 上一次确定的前台 Activity；1.13.14 起只用来在 Activity 取不到
      * 时当窗口 key 的退路（和诊断），不再是自动播放的硬门。 */
     private var lastKnownVoiceWindow: String? = null
@@ -95,79 +106,68 @@ class VoiceService : AccessibilityService() {
         }
     }
 
-    /** 1.13.15 从 SharedPreferences 恢复自动播放状态（服务重连时调一次）。
-     * 键：played.<窗口>、seen.<窗口>（逗号拼起来的 SHA-256 前 16 位，按插入
-     * 顺序排）、lastWindow。另兼容 1.13.14 的旧键：lastPlayed.<窗口>（单条）
-     * 并进 played，lastSeen.<窗口>（上一轮可见集合）并进 seen，读完删旧键。 */
+    /** 1.13.16 从 SharedPreferences 恢复自动播放状态（服务重连时调一次）。
+     * 键：played、seen（全局共用，逗号拼起来的 SHA-256 前 16 位，按插入
+     * 顺序排）、lastWindow。迁移：1.13.15 的按窗口旧键 played.<窗口> /
+     * seen.<窗口>（所有窗口的都并进全局集合，读完删旧键）；另兼容 1.13.14
+     * 的旧键 lastPlayed.<窗口>（单条）并进 played，lastSeen.<窗口>（上一轮
+     * 可见集合）并进 seen，读完删旧键。 */
     private fun loadAutoplayState() {
         try {
             val all = autoplayPrefs.all
-            for ((k, v) in all) {
-                when {
-                    k.startsWith("played.") && v is String ->
-                        playedTranscriptsByWindow[k.removePrefix("played.")] =
-                            LinkedHashSet(v.split(',').filter { it.isNotEmpty() })
-                    k.startsWith("seen.") && v is String ->
-                        seenTranscriptsByWindow[k.removePrefix("seen.")] =
-                            LinkedHashSet(v.split(',').filter { it.isNotEmpty() })
-                    k == "lastWindow" && v is String -> lastKnownVoiceWindow = v
-                }
-            }
             val ed = autoplayPrefs.edit()
             var migrated = false
             for ((k, v) in all) {
                 when {
+                    k == "played" && v is String ->
+                        playedTranscripts.addAll(v.split(',').filter { it.isNotEmpty() })
+                    k == "seen" && v is String ->
+                        seenTranscripts.addAll(v.split(',').filter { it.isNotEmpty() })
+                    k.startsWith("played.") && v is String -> {
+                        playedTranscripts.addAll(v.split(',').filter { it.isNotEmpty() })
+                        ed.remove(k)
+                        migrated = true
+                    }
+                    k.startsWith("seen.") && v is String -> {
+                        seenTranscripts.addAll(v.split(',').filter { it.isNotEmpty() })
+                        ed.remove(k)
+                        migrated = true
+                    }
                     k.startsWith("lastPlayed.") && v is String -> {
-                        playedTranscriptsByWindow.getOrPut(k.removePrefix("lastPlayed.")) { LinkedHashSet() }.add(v)
+                        playedTranscripts.add(v)
                         ed.remove(k)
                         migrated = true
                     }
                     k.startsWith("lastSeen.") && v is Set<*> -> {
-                        seenTranscriptsByWindow.getOrPut(k.removePrefix("lastSeen.")) { LinkedHashSet() }
-                            .addAll(v.filterIsInstance<String>())
+                        seenTranscripts.addAll(v.filterIsInstance<String>())
                         ed.remove(k)
                         migrated = true
                     }
+                    k == "lastWindow" && v is String -> lastKnownVoiceWindow = v
                 }
             }
+            trimAutoplaySet(playedTranscripts)
+            trimAutoplaySet(seenTranscripts)
             if (migrated) ed.apply()
         } catch (_: Exception) {
         }
     }
 
-    /** 1.13.15 取某窗口的持久集合，并定下这轮用的 key：Activity key 有状态
-     * 就用它；没有就退到包名 key（服务重启后 Activity 才学到，之前的状态
-     * 可能记在包名 key 下，升级迁移的旧状态也在包名 key 下）；两个都没有
-     * 就在 Activity key 下建空集。返回（key，集合）。 */
-    private fun autoplaySet(map: MutableMap<String, LinkedHashSet<String>>, activity: String): Pair<String, LinkedHashSet<String>> {
-        map[activity]?.let { return activity to it }
-        if (activity != MUSE_PKG) {
-            map[MUSE_PKG]?.let {
-                map[activity] = it
-                return activity to it
-            }
-        }
-        val s = LinkedHashSet<String>()
-        map[activity] = s
-        return activity to s
-    }
-
-    /** 1.13.15 集合封顶（先进先出）：LinkedHashSet 按插入顺序排，超了删最老的。 */
+    /** 1.13.16 集合封顶（先进先出）：LinkedHashSet 按插入顺序排，超了删最老的。 */
     private fun trimAutoplaySet(s: LinkedHashSet<String>) {
         while (s.size > AUTOPLAY_SET_CAP) s.remove(s.first())
     }
 
-    private fun savePlayed(window: String) {
+    /** 1.13.16 集合全局共用，存盘 key 就是 played / seen（不带窗口后缀）。 */
+    private fun savePlayed() {
         try {
-            val s = playedTranscriptsByWindow[window] ?: return
-            autoplayPrefs.edit().putString("played.$window", s.joinToString(",")).apply()
+            autoplayPrefs.edit().putString("played", playedTranscripts.joinToString(",")).apply()
         } catch (_: Exception) { }
     }
 
-    private fun saveSeen(window: String) {
+    private fun saveSeen() {
         try {
-            val s = seenTranscriptsByWindow[window] ?: return
-            autoplayPrefs.edit().putString("seen.$window", s.joinToString(",")).apply()
+            autoplayPrefs.edit().putString("seen", seenTranscripts.joinToString(",")).apply()
         } catch (_: Exception) { }
     }
 
@@ -262,6 +262,14 @@ class VoiceService : AccessibilityService() {
      * 不点（气泡在视口边缘、真文字被滑出视野时查找会抓附近 UI 文本当身份）。
      * 残留缺口：一条旧语音以前从没露过脸，往上滑第一次翻出来时可能还是会
      * 放一次，放过就记住了，以后再滑到也不放（只看视口的固有限制，接受）。
+     * 1.13.16：两个集合按窗口分是错的——悬浮栏和主聊天显示的是同一段对话，
+     * 同一条语音在两个窗口里是同一条消息。日志确认：悬浮栏 16:09:22/47/56
+     * 点了 len=43 的“收到了，”三条，主聊天 16:10:08/09 又点了两条 len=43
+     * 的“收到了，”；xml 确认集合按窗口键（played./seen. + Activity 类名），
+     * 悬浮栏放过的 6 条里有 4 条不在主聊天的 played 里。改成全局共用：不管
+     * 在哪个窗口放过/见过，都只放一次；升级时把各窗口的旧集合全并进全局，
+     * 再删按窗口的旧键；首次扫描基线也改成全局的（两个全局集合都空才只记
+     * 不点）。lastWindow 只留作日志/诊断。
      */
     private fun maybeAutoPlayVoice(e: AccessibilityEvent) {
         // 1.13.13：先记滚动/内容变化信号（不管这次事件会不会触发扫描），滑到底
@@ -332,13 +340,11 @@ class VoiceService : AccessibilityService() {
         }
         val tag = transcriptTag(transcript)
         val tkey = transcriptKey(transcript)
-        // 1.13.15 持久集合：本轮可见的真实转写文字身份（SHA-256 前 16 位）全
-        // 部并进 seen——不管视口怎么抖、不管用户怎么滑，一条旧语音只要以前
-        // 露过脸就不会再点。短转写 / UI 标签不进集合（那是查找抓错的幻影）。
+        // 1.13.16 持久集合全局共用：不管在哪个窗口放过/见过，都只放一次。
         // 先判它以前见没见过、再并进来：不然这轮刚并进去就查“在不在 seen 里”
         // 永远是“在”，新语音也点不出来。
-        val (seenKey, seen) = autoplaySet(seenTranscriptsByWindow, activity)
-        val (playedKey, played) = autoplaySet(playedTranscriptsByWindow, activity)
+        val seen = seenTranscripts
+        val played = playedTranscripts
         val isFirstScan = seen.isEmpty() && played.isEmpty()
         val wasSeen = tkey in seen
         val wasPlayed = tkey in played
@@ -346,7 +352,7 @@ class VoiceService : AccessibilityService() {
             .filter { isRealTranscript(it) }.map { transcriptKey(it) }
         if (seen.addAll(thisVisible)) {
             trimAutoplaySet(seen)
-            saveSeen(seenKey)
+            saveSeen()
         }
         // 1.13.15 短转写过滤：长度 <4 或命中已知 UI 标签（“消息”）的文字不点
         // ——气泡在视口边缘、真文字被滑出视野时，查找会抓附近的 UI 文本当
@@ -355,16 +361,17 @@ class VoiceService : AccessibilityService() {
             logAutoplay(activity, count, -1, "skip transcript-too-short $tag")
             return
         }
-        // 1.13.15 首次扫描基线：窗口第一次见时只记不点，装机时已在视口里的
-        // 旧语音永远不会被点（这轮可见的文字上面已经全并进 seen 了）。
+        // 1.13.16 首次扫描基线：两个全局集合都空（全新安装）时只记不点，装机
+        // 时已在视口里的旧语音永远不会被点（这轮可见的文字上面已经全并进
+        // seen 了）。升级迁移过的旧状态不算空，不会误当基线。
         if (isFirstScan) {
-            logAutoplay(activity, count, -1, "baseline first-scan-in-window $tag")
+            logAutoplay(activity, count, -1, "baseline first-scan $tag")
             return
         }
-        // 1.13.15 点最下面那条的规则：文字既不在 seen 也不在 played 里才点。
-        // seen 是以前任何一轮露过脸的文字，played 是点过放过的文字；视口抖
-        // 动、用户上下滑都不会把旧语音变回“新的”。（wasSeen/wasPlayed 是
-        // 并进 seen 之前判的，不然新语音这轮一并进来就变成“见过”了。）
+        // 1.13.16 点最下面那条的规则：文字既不在 seen 也不在 played 里才点。
+        // seen/played 都是全局的：悬浮栏里放过/见过的，主聊天也认，不会重播。
+        // （wasSeen/wasPlayed 是并进 seen 之前判的，不然新语音这轮一并进来
+        // 就变成“见过”了。）
         if (wasPlayed) {
             logAutoplay(activity, count, -1, "skip already-played $tag")
             return
@@ -379,7 +386,7 @@ class VoiceService : AccessibilityService() {
             // 后别再点它一遍。
             if (played.add(tkey)) {
                 trimAutoplaySet(played)
-                savePlayed(playedKey)
+                savePlayed()
             }
             logAutoplay(activity, count, -1, "skip bottom-most-already-playing $tag")
             return
@@ -388,7 +395,7 @@ class VoiceService : AccessibilityService() {
         if (clicked) {
             if (played.add(tkey)) {
                 trimAutoplaySet(played)
-                savePlayed(playedKey)
+                savePlayed()
             }
         }
         logAutoplay(activity, count, -1, "click bottom-most clicked=$clicked $tag")
