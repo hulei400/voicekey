@@ -37,11 +37,15 @@ class VoiceService : AccessibilityService() {
      */
     private var foregroundActivity: String? = null
     private var foregroundActivityPkg: String? = null
-    /** 1.13.8 Muse 语音自动播放：上次扫描时间（500ms 防抖）与已放过的语音气泡序号集合；
-     * 1.13.9 起序号是 key（从上往下 0 起），不用 bounds——bounds 会随聊天滚动变，播完
-     * 变回“播放”后对不上旧位置就重播；序号不随滚动变。 */
+    /** 1.13.8 Muse 语音自动播放：上次扫描时间（500ms 防抖）。
+     * 1.13.10 起不再用任何集合当“已放”记号（bounds 随滚动变、序号跨窗口撞号）：
+     * 改成按窗口记上次扫描到的语音气泡个数——个数增加了才说明来了新的一条，
+     * 才点最下面那条；个数没变就什么都不做，播完变回“播放”也不会重播。
+     * key 是前台 Activity 类名（悬浮栏 HatchAssistOverlayActivity 和主聊天
+     * AuraMainActivity 各记各的），切窗口不会互相干扰；某窗口第一次见时只记
+     * 个数、不点，避免把旧气泡当成新的放出来。 */
     private var lastVoiceScanMs = 0L
-    private val playedVoiceIndex = LinkedHashSet<Int>()
+    private val lastVoiceCountByWindow = mutableMapOf<String, Int>()
 
     /** 设置页录制长按组合：非空时接管按键，录完回调结果；null 表示取消 */
     var recorder: ((List<Int>?) -> Unit)? = null
@@ -83,32 +87,67 @@ class VoiceService : AccessibilityService() {
      * 1.13.8 Muse 聊天语音消息自动播放。开关 museVoiceAutoPlay 是唯一的门（默认关，
      * 关着时直接返回、什么都不做）；只在 Muse 包里工作，无障碍服务只能看到前台窗口
      * 的节点，Muse 不在前台时自然不触发，不用另加前台判断。
-     * 新消息出现（内容变化/滚动）时扫描一次，带 500ms 防抖；找到未播过的语音气泡
-     * 就点它的播放按钮。只认未播状态（内容描述恰好是“播放”，播放中大概率变“暂停”
-     * 就不认）；播完变回“播放”时靠已放集合不再重播；新气泡（序号更大）才再放。
-     * 1.13.9：已放集合的 key 是语音气泡在当前全部语音气泡里的序号（从上往下 0 起），
-     * 不用 bounds——bounds 会随聊天滚动变，播完对不上旧位置就重播；序号不随滚动变。
-     * 输入框、发送箭头、悬浮栏那条路都不碰。
+     * 新消息出现（内容变化/滚动）时扫描一次，带 500ms 防抖；只认未播状态（内容描述
+     * 恰好是“播放”，播放中大概率变“暂停”就不认）。
+     * 1.13.10：不再用 bounds/序号当“已放”记号——bounds 随聊天滚动变（1.13.8 重播），
+     * 序号跨窗口撞号（1.13.9：悬浮栏只露出 2 条、序号 0/1，主聊天早记过 0/1，已放
+     * 集合全局共用，悬浮栏里的 0/1 就被当成放过、跳过，悬浮栏里一直没放）。改成按
+     * 窗口数气泡个数：只有个数比上次增加了（说明来了新的一条），才点最下面那条；
+     * 个数没变就什么都不做，播完变回“播放”也不会重播；某窗口第一次见只记个数、
+     * 不点。输入框、发送箭头、悬浮栏那条路都不碰。
+     * 每次扫描记一行 vk-autoplay-trace.log（时间/窗口/个数/上次个数/动作与理由），
+     * Log.d 不进 logcat，决策不能再是黑盒。
      */
     private fun maybeAutoPlayVoice(e: AccessibilityEvent) {
         if (e.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED &&
             e.eventType != AccessibilityEvent.TYPE_VIEW_SCROLLED
         ) return
-        if (!App.prefs.museVoiceAutoPlay) return
-        if (foregroundPackage() != MUSE_PKG) return
         val now = SystemClock.elapsedRealtime()
         if (now - lastVoiceScanMs < VOICE_SCAN_DEBOUNCE_MS) return
         lastVoiceScanMs = now
-        val root = rootInActiveWindow ?: return
+        val activity = foregroundActivity ?: "?"
+        if (!App.prefs.museVoiceAutoPlay) {
+            logAutoplay(activity, -1, -1, "skip switch-off")
+            return
+        }
+        val pkg = foregroundPackage()
+        if (pkg != MUSE_PKG) {
+            logAutoplay(activity, -1, -1, "skip not-muse pkg=$pkg")
+            return
+        }
+        val root = rootInActiveWindow
+        if (root == null) {
+            logAutoplay(activity, -1, -1, "skip no-root")
+            return
+        }
         val plays = findVoicePlayButtons(root)
-        if (plays.isEmpty()) return
-        val index = plays.size - 1
-        if (index in playedVoiceIndex) return
-        val play = plays[index]
-        if (play.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-            playedVoiceIndex.add(index)
-            while (playedVoiceIndex.size > VOICE_PLAYED_CAP) playedVoiceIndex.remove(playedVoiceIndex.first())
-            Log.d(TAG, "muse voice autoplay: clicked play button index=$index count=${plays.size}")
+        val count = plays.size
+        val prev = lastVoiceCountByWindow[activity]
+        lastVoiceCountByWindow[activity] = count
+        if (prev == null) {
+            logAutoplay(activity, count, -1, "baseline first-scan-in-window")
+            return
+        }
+        if (count <= prev) {
+            logAutoplay(activity, count, prev, "skip count-not-increased")
+            return
+        }
+        val play = plays[count - 1]
+        val clicked = play.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        logAutoplay(activity, count, prev, "click bottom-most clicked=$clicked")
+        if (clicked) Log.d(TAG, "muse voice autoplay: clicked play button count=$count prev=$prev activity=$activity")
+    }
+
+    /** 1.13.10 自动播放文件日志：Log.d 不进 logcat，决策写文件（VoiceKey files 目录的
+     * vk-autoplay-trace.log，和 vk-session-trace.log 分开），每次扫描一行——时间、
+     * 窗口、语音气泡数、上次个数、动作与跳过理由。下次再报“没放”直接读这个日志定。 */
+    private fun logAutoplay(activity: String, count: Int, prev: Int, msg: String) {
+        try {
+            val f = java.io.File(filesDir, "vk-autoplay-trace.log")
+            if (f.exists() && f.length() > 512 * 1024) f.delete()
+            val wall = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US).format(java.util.Date(System.currentTimeMillis()))
+            f.appendText("$wall activity=$activity count=$count prev=$prev $msg\n")
+        } catch (_: Exception) {
         }
     }
 
@@ -118,10 +157,8 @@ class VoiceService : AccessibilityService() {
      * Button 内容描述“播放” + 同气泡里 ProgressBar 内容描述“音频进度” +
      * 时长 TextView（m:ss 格式，如 0:00）。气泡本身不一定是
      * hatch-message-assistant-latest（最新文本消息占着它），所以扫描全部助手气泡；
-     * 多条未播语音在屏上时取最下面那条（序号最大）。
-     * 1.13.9：序号当已放集合的 key——序号不随聊天滚动变（新消息进来旧气泡序号不变；
-     * 新语音来了它是序号最大的那条），bounds 当 key 会随滚动变、播完变回“播放”后
-     * 对不上旧位置就重播。
+     * 多条未播语音在屏上时取最下面那条。
+     * 1.13.10 起返回的列表只用来数个数和取最下面那条，不再用序号/bounds 当 key。
      */
     private fun findVoicePlayButtons(root: AccessibilityNodeInfo): List<AccessibilityNodeInfo> {
         val found = mutableListOf<Pair<AccessibilityNodeInfo, Int>>()
@@ -486,7 +523,6 @@ class VoiceService : AccessibilityService() {
         private const val TEXT_VIEW_CLASS = "android.widget.TextView"
         private val DURATION_RE = Regex("^\\d+:\\d{2}$")
         private const val VOICE_SCAN_DEBOUNCE_MS = 500L
-        private const val VOICE_PLAYED_CAP = 100
         private val SEND = listOf("发送", "Send")
         private val ACTIONS = setOf(EditorInfo.IME_ACTION_SEND, EditorInfo.IME_ACTION_GO, EditorInfo.IME_ACTION_SEARCH, EditorInfo.IME_ACTION_DONE)
 
