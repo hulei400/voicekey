@@ -39,17 +39,26 @@ class VoiceService : AccessibilityService() {
     private var foregroundActivityPkg: String? = null
     /** 1.13.8 Muse 语音自动播放：上次扫描时间（500ms 防抖）。
      * 1.13.10 起不再用任何集合当“已放”记号（bounds 随滚动变、序号跨窗口撞号）：
-     * 改成按窗口记上次扫描到的语音气泡个数——个数增加了才说明来了新的一条，
-     * 才点最下面那条；个数没变就什么都不做，播完变回“播放”也不会重播。
+     * 改成按窗口记语音气泡个数——个数增加了才说明来了新的一条，才点最下面那条；
+     * 个数没变就什么都不做，播完变回“播放”也不会重播。
      * key 是前台 Activity 类名（悬浮栏 HatchAssistOverlayActivity 和主聊天
      * AuraMainActivity 各记各的），切窗口不会互相干扰；某窗口第一次见时只记
      * 个数、不点，避免把旧气泡当成新的放出来。
      * 1.13.11：数的必须是对面“全部”气泡——1.13.10 只数未播（只认“播放”），
      * 播着的（按钮变“暂停”）不算，个数随播放状态 0↔1 震荡，0→1 被误当成新消息，
      * 同一条 53 秒里被点了 9 次。改成按钮“播放”或“暂停”都算，个数不再跟播放
-     * 状态走；点之前再看最下面那条按钮是不是“播放”（“暂停”就跳过）。 */
+     * 状态走；点之前再看最下面那条按钮是不是“播放”（“暂停”就跳过）。
+     * 1.13.12：记的不是上次个数，而是该窗口见过的最大个数（高水位）——
+     * 1.13.11 数的是“当前这次扫描的无障碍树里可见几条”（Compose LazyColumn
+     * 只拼视口里的项），可见个数在列表滚动/重组时自己会抖（3↔2↔1）：发一条
+     * 文字消息、列表重排，个数先掉到 1、又弹回 3，上次个数被拉低后弹回就成了
+     * 一次“个数增加”，点了最下面那条旧语音。高水位只升不降，抖动弹回 3
+     * 不超过 3 就不点；真来新语音到 4（> 最大值）才点。 */
     private var lastVoiceScanMs = 0L
-    private val lastVoiceCountByWindow = mutableMapOf<String, Int>()
+    private val maxVoiceCountByWindow = mutableMapOf<String, Int>()
+    /** 1.13.12 上一次确定的前台 Activity（取不到前台 Activity 时沿用它，别拿
+     * "?" 当新窗口；从没确定过就跳过这次扫描）。 */
+    private var lastKnownVoiceWindow: String? = null
 
     /** 设置页录制长按组合：非空时接管按键，录完回调结果；null 表示取消 */
     var recorder: ((List<Int>?) -> Unit)? = null
@@ -99,7 +108,7 @@ class VoiceService : AccessibilityService() {
      * 窗口数气泡个数：只有个数比上次增加了（说明来了新的一条），才点最下面那条；
      * 个数没变就什么都不做，播完变回“播放”也不会重播；某窗口第一次见只记个数、
      * 不点。输入框、发送箭头、悬浮栏那条路都不碰。
-     * 每次扫描记一行 vk-autoplay-trace.log（时间/窗口/个数/上次个数/动作与理由），
+     * 每次扫描记一行 vk-autoplay-trace.log（时间/窗口/个数/历史最大个数/动作与理由），
      * Log.d 不进 logcat，决策不能再是黑盒。
      * 1.13.11：数的必须是对面“全部”气泡——1.13.10 只数未播（只认“播放”按钮），
      * 播着的按钮变“暂停”不算，个数随播放状态 0↔1 震荡（播完变回“播放”又回到 1），
@@ -107,6 +116,12 @@ class VoiceService : AccessibilityService() {
      * 都算一个气泡，个数不再跟播放状态走；点之前再看最下面那条按钮是不是“播放”
      * （“暂停”就跳过）。进度控件按 content-desc“音频进度”认（未播时是
      * ProgressBar、播着时是 SeekBar，别写死类名）。
+     * 1.13.12：记的不是上次个数，而是该窗口的“历史最大个数”（高水位）——
+     * 1.13.11 数的是当前扫描里可见几条，可见个数在列表滚动/重组时自己抖
+     * （3↔2↔1）：发一条文字消息、列表重排，个数先掉到 1、又弹回 3，上次个数
+     * 被拉低后弹回就成了“个数增加”，点了最下面那条旧语音。高水位只升不降，
+     * 只有超过历史最大才当成新语音。取不到前台 Activity 时沿用上一次确定的
+     * 窗口；从来没确定过就跳过这次扫描、别点。
      */
     private fun maybeAutoPlayVoice(e: AccessibilityEvent) {
         if (e.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED &&
@@ -115,7 +130,14 @@ class VoiceService : AccessibilityService() {
         val now = SystemClock.elapsedRealtime()
         if (now - lastVoiceScanMs < VOICE_SCAN_DEBOUNCE_MS) return
         lastVoiceScanMs = now
-        val activity = foregroundActivity ?: "?"
+        // 1.13.12：取不到前台 Activity 时沿用上一次确定的窗口，别拿 "?" 当新窗口
+        // （否则 max 会被拆到 "?" 和真窗口两个 key 下）；从来没确定过就跳过这次扫描。
+        val activity = foregroundActivity ?: lastKnownVoiceWindow
+        if (activity == null) {
+            logAutoplay("?", -1, -1, "skip no-activity")
+            return
+        }
+        lastKnownVoiceWindow = activity
         if (!App.prefs.museVoiceAutoPlay) {
             logAutoplay(activity, -1, -1, "skip switch-off")
             return
@@ -132,29 +154,32 @@ class VoiceService : AccessibilityService() {
         }
         val plays = findVoiceBubbleButtons(root)
         val count = plays.size
-        val prev = lastVoiceCountByWindow[activity]
-        lastVoiceCountByWindow[activity] = count
-        if (prev == null) {
+        // 1.13.12 高水位：只升不降。可见个数抖动（3↔2↔1）不会拉低它，弹回 3
+        // 不超过 3 就不点；真来新语音到 4（> 最大值）才点最下面那条。
+        val max = maxVoiceCountByWindow[activity]
+        if (max == null) {
+            maxVoiceCountByWindow[activity] = count
             logAutoplay(activity, count, -1, "baseline first-scan-in-window")
             return
         }
-        if (count <= prev) {
-            logAutoplay(activity, count, prev, "skip count-not-increased")
+        if (count <= max) {
+            logAutoplay(activity, count, max, "skip count-not-increased")
             return
         }
+        maxVoiceCountByWindow[activity] = count
         val play = plays[count - 1]
         if (play.contentDescription?.toString()?.trim() != PLAY_DESC) {
-            logAutoplay(activity, count, prev, "skip bottom-most-already-playing")
+            logAutoplay(activity, count, max, "skip bottom-most-already-playing")
             return
         }
         val clicked = play.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        logAutoplay(activity, count, prev, "click bottom-most clicked=$clicked")
-        if (clicked) Log.d(TAG, "muse voice autoplay: clicked play button count=$count prev=$prev activity=$activity")
+        logAutoplay(activity, count, max, "click bottom-most clicked=$clicked")
+        if (clicked) Log.d(TAG, "muse voice autoplay: clicked play button count=$count max=$max activity=$activity")
     }
 
     /** 1.13.10 自动播放文件日志：Log.d 不进 logcat，决策写文件（VoiceKey files 目录的
      * vk-autoplay-trace.log，和 vk-session-trace.log 分开），每次扫描一行——时间、
-     * 窗口、语音气泡数、上次个数、动作与跳过理由。下次再报“没放”直接读这个日志定。 */
+     * 窗口、语音气泡数、历史最大个数、动作与跳过理由。下次再报“没放”直接读这个日志定。 */
     private fun logAutoplay(activity: String, count: Int, prev: Int, msg: String) {
         try {
             val f = java.io.File(filesDir, "vk-autoplay-trace.log")
