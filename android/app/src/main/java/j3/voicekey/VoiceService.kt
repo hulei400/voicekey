@@ -74,16 +74,16 @@ class VoiceService : AccessibilityService() {
     fun isMuseForeground(): Boolean = foregroundPackage() == MUSE_PKG
 
     /**
-     * Muse 悬浮栏搜索框识别（与聊天界面的输入框区分，1.13.3 唯一的上屏目标）。
+     * Muse 悬浮栏搜索框识别（与聊天界面的输入框区分）。
      *
      * 两个包都叫 com.facebook.aura、窗口结构也无法从代码上可靠区分，所以不用窗口特征，
      * 只用输入框自身的信号，主信号是输入法侧的动作：
      * ① 当前聚焦编辑框的 IME 动作是“搜索”（IME_ACTION_SEARCH）——搜索框的典型动作，
      *    聊天输入框的动作一般是“发送”，不会命中；
      * ② 提示文字/内容描述含“搜索”/“Search”（备用信号）。
-     * 两个信号都没命中就返回 false（宁可不上屏，也不写进聊天输入框）。
+     * 1.13.4 起只用来选上屏路径：命中走悬浮栏上屏，没命中走普通上屏路径，不再拒绝启动。
      * 注意：这两个信号都未在真机悬浮栏上核对过——如果悬浮栏搜索框的 IME 动作不是
-     * SEARCH 且提示文字也不含“搜索”，1.13.3 会拒绝上屏，届时按日志里的 imeAction/hint 再调。
+     * SEARCH 且提示文字也不含“搜索”，悬浮栏会按普通路径上屏，届时按日志里的 imeAction/hint 再调。
      */
     fun isMuseOverlaySearchBox(node: AccessibilityNodeInfo): Boolean {
         if (!node.isEditable || !node.isVisibleToUser) return false

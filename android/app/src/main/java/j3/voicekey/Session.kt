@@ -87,21 +87,12 @@ class Session(private val svc: VoiceService) {
         val g = ++gen
         selectionTiming = App.prefs.jevSelectionTiming()
         target = svc.focusedInput()
-        // 1.13.3 悬浮栏上屏（开关开着、且当前在 Muse 里）：目标只限悬浮栏搜索框。
-        // 不是搜索框（例如聊天界面输入框）就不开始；框里已有用户自己打的字也不开始、不覆盖。
-        overlayFlow = false
-        if (App.prefs.museOverlayInsert && svc.isMuseForeground()) {
-            val box = target?.takeIf { svc.isMuseOverlaySearchBox(it) }
-            if (box == null) {
-                svc.hud.info("请先点开 Muse 悬浮栏的搜索框")
-                return
-            }
-            if (!svc.nodeTextEmpty(box)) {
-                svc.hud.info("搜索框里已有文字，未写入")
-                return
-            }
-            overlayFlow = true
-        }
+        // 1.13.4：手动触发永远不被门禁挡。悬浮栏认框只用来选上屏路径：
+        // 开关开着、在 Muse 里、且当前聚焦框是悬浮栏搜索框 → 走 insertForOverlay
+        // （上屏前再核一次框里有没有用户自己打的字，有就不写）；
+        // 否则走普通上屏路径（1.13.1 的行为）。不拒绝、不弹提示。
+        overlayFlow = App.prefs.museOverlayInsert && svc.isMuseForeground() &&
+            (target?.let { svc.isMuseOverlaySearchBox(it) } == true)
         rows = (if (ready.size > 1) ready.sortedByDescending { App.prefs.pickCount(it) } else ready).map { Row(it) }
         picking = rows.size > 1
         userPicked = false
