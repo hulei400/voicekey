@@ -50,16 +50,65 @@ class VoiceService : AccessibilityService() {
      * 发文字消息、滚动、重组、播完变回“播放”都不会换文字，都不点。
      * key 是前台 Activity 类名（悬浮栏 HatchAssistOverlayActivity 和主聊天
      * AuraMainActivity 各记各的），切窗口不会互相干扰；某窗口第一次见时只记
-     * 文字、不点，避免把旧气泡当成新的放出来。 */
+     * 文字、不点，避免把旧气泡当成新的放出来。
+     * 1.13.14：不要把 Activity 当硬门——1.13.12 的“取不到就整段跳过”是回归
+     * （Activity 只能在窗口切换事件里学到，服务一重启用户又一直停在同一个
+     * Activity 里不切换，Activity 就永远是 null，扫描一次都没跑过）。改成
+     * 先拿包名当门，状态 key 用“Activity（取得到时）否则上次窗口否则包名”；
+     * 转写身份存 SHA-256 前 16 位（只比相等，不存全文），状态持久化到
+     * SharedPreferences “voice_autoplay”，服务重启也不丢。 */
     private var lastVoiceScanMs = 0L
-    /** 1.13.13 该窗口上次放过的语音的文字（身份）。 */
+    /** 1.13.14 自动播放状态持久化（SharedPreferences “voice_autoplay”）。 */
+    private val autoplayPrefs by lazy { getSharedPreferences("voice_autoplay", Context.MODE_PRIVATE) }
+    /** 1.13.13 该窗口上次放过的语音的文字身份（SHA-256 前 16 位）。 */
     private val lastPlayedTranscriptByWindow = mutableMapOf<String, String>()
-    /** 1.13.13 上次扫描时该窗口可见的全部语音文字（新旧判断用：文字不在上一
-     * 次可见集合里，说明它刚进视口；滚动回旧语音时文字早在集合里，不点）。 */
+    /** 1.13.13 上次扫描时该窗口可见的全部语音文字身份（SHA-256 前 16 位；
+     * 新旧判断用：文字不在上一次可见集合里，说明它刚进视口；滚动回旧语音时
+     * 文字早在集合里，不点）。 */
     private val lastScanTranscriptsByWindow = mutableMapOf<String, Set<String>>()
-    /** 1.13.12 上一次确定的前台 Activity（取不到前台 Activity 时沿用它，别拿
-     * "?" 当新窗口；从没确定过就跳过这次扫描）。 */
+    /** 1.13.12 上一次确定的前台 Activity；1.13.14 起只用来在 Activity 取不到
+     * 时当窗口 key 的退路（和诊断），不再是自动播放的硬门。 */
     private var lastKnownVoiceWindow: String? = null
+
+    /** 1.13.14 转写文字的身份：SHA-256 前 16 位（只比相等，不存全文）。 */
+    private fun transcriptKey(t: String): String {
+        return try {
+            val md = java.security.MessageDigest.getInstance("SHA-256")
+            md.digest(t.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }.take(16)
+        } catch (_: Exception) {
+            "h${t.hashCode()}"
+        }
+    }
+
+    /** 1.13.14 从 SharedPreferences 恢复自动播放状态（服务重连时调一次）。
+     * 键：lastPlayed.<窗口>、lastSeen.<窗口>、lastWindow。 */
+    private fun loadAutoplayState() {
+        try {
+            for ((k, v) in autoplayPrefs.all) {
+                when {
+                    k.startsWith("lastPlayed.") && v is String ->
+                        lastPlayedTranscriptByWindow[k.removePrefix("lastPlayed.")] = v
+                    k.startsWith("lastSeen.") && v is Set<*> ->
+                        lastScanTranscriptsByWindow[k.removePrefix("lastSeen.")] =
+                            v.filterIsInstance<String>().toSet()
+                    k == "lastWindow" && v is String -> lastKnownVoiceWindow = v
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun saveLastPlayed(window: String, key: String) {
+        try { autoplayPrefs.edit().putString("lastPlayed.$window", key).apply() } catch (_: Exception) { }
+    }
+
+    private fun saveLastSeen(window: String, keys: Set<String>) {
+        try { autoplayPrefs.edit().putStringSet("lastSeen.$window", keys).apply() } catch (_: Exception) { }
+    }
+
+    private fun saveLastWindow(window: String) {
+        try { autoplayPrefs.edit().putString("lastWindow", window).apply() } catch (_: Exception) { }
+    }
     /** 1.13.13 最近一次滚动事件（TYPE_VIEW_SCROLLED，在 Muse 包里才记）：
      * 列表滑到底的判断。LazyColumn 滚动事件是否报真实总数（itemCount），
      * 实现时没法在盒子上验——把它写进日志，真机上能从日志反推；拿不到
@@ -85,6 +134,7 @@ class VoiceService : AccessibilityService() {
         hud = Hud(this)
         bubble = Bubble(this)
         instance = this
+        loadAutoplayState()
         MicService.start(this)
         refresh()
     }
@@ -125,6 +175,15 @@ class VoiceService : AccessibilityService() {
      * 文字没变（发文字消息、滚动、重组、播完变回“播放”）就不点。某窗口
      * 第一次见只记文字、不点。找不到文字的气泡跳过不点、记跳过理由。
      * 两条语音文字一字不差会撞号（第二条不放）——极少见，且是漏放不是重播。
+     * 1.13.14：不要把 Activity 当硬门——1.13.12 的“取不到前台 Activity 就
+     * 整段跳过”（skip no-activity）是回归。Activity 只能在窗口切换事件里
+     * 学到，服务一重启（每次 pm install -r 都会杀进程重起）用户又一直停在
+     * 同一个 Activity 里不切换，Activity 就永远是 null，扫描一次都没跑过
+     * （1.13.13 的转写逻辑全日志 0 行）。改成先拿包名当门（有前台窗口就一
+     * 定拿得到包名；包名是 Muse 就直接扫描），状态 key 用“Activity（取得到
+     * 时）否则上次窗口否则包名”，读不到 Activity key 时退到包名 key；转写
+     * 身份存 SHA-256 前 16 位，状态（各窗口上次放过的文字身份、上次可见集合、
+     * 上次窗口）持久化到 SharedPreferences “voice_autoplay”，服务重启也不丢。
      */
     private fun maybeAutoPlayVoice(e: AccessibilityEvent) {
         // 1.13.13：先记滚动/内容变化信号（不管这次事件会不会触发扫描），滑到底
@@ -142,21 +201,38 @@ class VoiceService : AccessibilityService() {
         ) return
         if (now - lastVoiceScanMs < VOICE_SCAN_DEBOUNCE_MS) return
         lastVoiceScanMs = now
-        // 1.13.12：取不到前台 Activity 时沿用上一次确定的窗口，别拿 "?" 当新窗口
-        // （否则状态会被拆到 "?" 和真窗口两个 key 下）；从来没确定过就跳过这次扫描。
-        val activity = foregroundActivity ?: lastKnownVoiceWindow
-        if (activity == null) {
-            logAutoplay("?", -1, -1, "skip no-activity")
-            return
-        }
-        lastKnownVoiceWindow = activity
-        if (!App.prefs.museVoiceAutoPlay) {
-            logAutoplay(activity, -1, -1, "skip switch-off")
-            return
-        }
+        // 1.13.14：不要把 Activity 当硬门。先拿包名——只要有前台窗口就一定拿得
+        // 到包名，包名不是 Muse 就跳过；是 Muse 就直接扫描。Activity 只用来分
+        // 窗口记状态，取不到时退化成用包名当 key（共用一个 key 是安全的：同一
+        // 时间只看得到一个 Muse 窗口，且转写文字本身就是语音的身份；共用反而
+        // 能防同一条语音从悬浮栏切到主聊天时重播）。1.13.12 的“取不到就整段
+        // 跳过”（skip no-activity）是回归：Activity 只能在窗口切换事件里学到，
+        // 服务一重启（每次 pm install -r 都会杀进程重起）用户又一直停在同一个
+        // Activity 里不切换，Activity 就永远是 null，自动播放彻底死了（1.13.13
+        // 的转写逻辑全日志 0 行，一次都没跑过）。skip no-activity 删掉。
         val pkg = foregroundPackage()
         if (pkg != MUSE_PKG) {
-            logAutoplay(activity, -1, -1, "skip not-muse pkg=$pkg")
+            logAutoplay(foregroundActivity ?: "?", -1, -1, "skip not-muse pkg=$pkg")
+            return
+        }
+        // 可选补学 Activity：foregroundActivity 为 null 时，从 getWindows()
+        // 取当前聚焦窗口根节点的类名——类名含 "Activity" 时才认（根节点一般
+        // 是 View 类，认不到就走包名退路，别硬等窗口切换事件）。
+        if (foregroundActivity == null) {
+            try {
+                val cls = windows.firstOrNull { it.isFocused }?.root?.className?.toString()
+                if (cls != null && cls.contains("Activity")) {
+                    foregroundActivity = cls
+                    foregroundActivityPkg = pkg
+                }
+            } catch (_: Exception) {
+            }
+        }
+        val activity = foregroundActivity ?: lastKnownVoiceWindow ?: MUSE_PKG
+        lastKnownVoiceWindow = activity
+        saveLastWindow(activity)
+        if (!App.prefs.museVoiceAutoPlay) {
+            logAutoplay(activity, -1, -1, "skip switch-off")
             return
         }
         val root = rootInActiveWindow
@@ -166,9 +242,14 @@ class VoiceService : AccessibilityService() {
         }
         val bubbles = findVoiceBubbles(root)
         val count = bubbles.size
-        // 退路用的上一轮可见文字集合：先读出来，再记这一轮的。
+        // 退路用的上一轮可见文字集合（身份是 SHA-256 前 16 位）：先读出来，再记
+        // 这一轮的。读不到 Activity key 时退到包名 key——Activity 是重启后才学
+        // 到的，之前的状态可能记在包名 key 下；两个 key 都没有才算第一次见。
         val prevVisible = lastScanTranscriptsByWindow[activity]
-        lastScanTranscriptsByWindow[activity] = bubbles.mapNotNull { it.second }.toSet()
+            ?: if (activity != MUSE_PKG) lastScanTranscriptsByWindow[MUSE_PKG] else null
+        val thisVisible = bubbles.mapNotNull { it.second }.map { transcriptKey(it) }.toSet()
+        lastScanTranscriptsByWindow[activity] = thisVisible
+        saveLastSeen(activity, thisVisible)
         if (bubbles.isEmpty()) {
             logAutoplay(activity, count, -1, "skip no-voice-bubbles")
             return
@@ -180,14 +261,18 @@ class VoiceService : AccessibilityService() {
             return
         }
         val tag = transcriptTag(transcript)
-        // 1.13.13 按文字认语音：第一次见某窗口只记文字、不点。
+        val tkey = transcriptKey(transcript)
+        // 1.13.13 按文字认语音：第一次见某窗口只记文字身份、不点。读不到
+        // Activity key 时退到包名 key。
         val lastPlayed = lastPlayedTranscriptByWindow[activity]
+            ?: if (activity != MUSE_PKG) lastPlayedTranscriptByWindow[MUSE_PKG] else null
         if (lastPlayed == null) {
-            lastPlayedTranscriptByWindow[activity] = transcript
+            lastPlayedTranscriptByWindow[activity] = tkey
+            saveLastPlayed(activity, tkey)
             logAutoplay(activity, count, -1, "baseline first-scan-in-window $tag")
             return
         }
-        if (transcript == lastPlayed) {
+        if (tkey == lastPlayed) {
             logAutoplay(activity, count, -1, "skip same-transcript $tag")
             return
         }
@@ -202,7 +287,7 @@ class VoiceService : AccessibilityService() {
         // 退路：拿不到总数时，光靠“文字变了”还不够——用户往上翻、把一条旧语音翻
         // 到视口底部时文字也会变。要求这条文字不在上次扫描可见的集合里（刚进
         // 视口的新语音才满足）；拿得到总数且已滑到底时不用这道闸。
-        if (atBottom == null && prevVisible != null && transcript in prevVisible) {
+        if (atBottom == null && prevVisible != null && tkey in prevVisible) {
             logAutoplay(activity, count, -1, "skip transcript-already-visible $tag")
             return
         }
@@ -210,12 +295,16 @@ class VoiceService : AccessibilityService() {
         if (play.contentDescription?.toString()?.trim() != PLAY_DESC) {
             // 已经在播了（用户手动点了、或之前放过）：记成已放，播完变回“播放”
             // 后别再点它一遍。
-            lastPlayedTranscriptByWindow[activity] = transcript
+            lastPlayedTranscriptByWindow[activity] = tkey
+            saveLastPlayed(activity, tkey)
             logAutoplay(activity, count, -1, "skip bottom-most-already-playing $tag")
             return
         }
         val clicked = play.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        if (clicked) lastPlayedTranscriptByWindow[activity] = transcript
+        if (clicked) {
+            lastPlayedTranscriptByWindow[activity] = tkey
+            saveLastPlayed(activity, tkey)
+        }
         logAutoplay(activity, count, -1, "click bottom-most clicked=$clicked atBottom=$atBottom $tag")
         if (clicked) Log.d(TAG, "muse voice autoplay: clicked play button $tag activity=$activity")
     }
