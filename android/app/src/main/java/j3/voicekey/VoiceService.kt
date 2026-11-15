@@ -25,7 +25,11 @@ class VoiceService : AccessibilityService() {
         private set
     private lateinit var bubble: Bubble
     private val main = Handler(Looper.getMainLooper())
-    private val check = Runnable { refresh() }
+    private val check = Runnable {
+        refresh()
+        // 1.13.17 悬浮栏自动触发轮询兜底：见 maybeAutoListenOverlayPoll
+        maybeAutoListenOverlayPoll()
+    }
     private var chordKeys = App.prefs.holdKeys
     private var chord = Chord(chordKeys)
     /** 1.13.4 悬浮栏自动触发：自动会话结束后抑制再触发，直到框失焦或悬浮栏关掉再重新聚焦 */
@@ -554,6 +558,48 @@ class VoiceService : AccessibilityService() {
     /** 自动触发的会话结束（上屏/失败/超时）后抑制再触发，直到框失焦或悬浮栏关掉 */
     fun suppressOverlayAuto() {
         overlayAutoSuppressed = true
+    }
+
+    /**
+     * 1.13.17 悬浮栏自动触发轮询兜底：只靠抓一次性的 TYPE_VIEW_FOCUSED /
+     * TYPE_WINDOW_STATE_CHANGED 事件会丢——2026-11-15 17:24:48 唤醒：模块
+     * ACTION_FOCUS 落下、延后核对 focused=true，但 VoiceKey 一次都没触发；
+     * 17:25:41 同样路径却触发了。150ms 的 check 每次都跑，这里直接查状态：
+     * 悬浮栏在前台、聚焦框就是悬浮栏搜索框、框里没字、没有会话在跑、没被
+     * 抑制，就直接调 session.autoStartOverlay()。事件路径
+     * maybeAutoListenOverlay 保留作第一道，轮询作兜底；事件丢了，下一次
+     * 任何无障碍事件（内容变化、滚动等）150ms 后的轮询也能补上。
+     * 触发后同样走 suppressOverlayAuto() 的抑制逻辑（Session.close 里调），
+     * 避免重复触发；抑制的解除条件（失焦/栏关）不动。
+     * 只记 Log.d（check 每 150ms 跑一次，写文件太吵；触发那一下由
+     * Session 的 BEGIN/AUTO 行记）。
+     */
+    private fun maybeAutoListenOverlayPoll() {
+        if (!::session.isInitialized) return
+        if (!App.prefs.museOverlayInsert) return
+        if (session.active || session.recording) return
+        if (overlayAutoSuppressed) return
+        if (!isMuseForeground()) return
+        // foregroundActivity 可能为 null（服务重连后一直停在同一个 Activity
+        // 里没切换）：像 maybeAutoPlayVoice 那样从 getWindows() 补学一次。
+        if (foregroundActivity == null) {
+            try {
+                val cls = windows.firstOrNull { it.isFocused }?.root?.className?.toString()
+                if (cls != null && cls.contains("Activity")) {
+                    foregroundActivity = cls
+                    foregroundActivityPkg = foregroundPackage()
+                }
+            } catch (_: Exception) {
+            }
+        }
+        val input = focusedInput() ?: return
+        if (!isMuseOverlaySearchBox(input)) return
+        // 聊天输入框（IME 动作 SEND）永不自动触发（Activity 已把聊天排除，
+        // 这是第二道）
+        if (focusedEditorAction() == EditorInfo.IME_ACTION_SEND) return
+        if (!nodeTextEmpty(input)) return
+        Log.d(TAG, "muse overlay poll trigger: activity=$foregroundActivity")
+        session.autoStartOverlay()
     }
 
     override fun onInterrupt() {}
