@@ -242,7 +242,7 @@ private fun Screen(tick: Int, refresh: () -> Unit) {
         }
 
         Section("说话方式") {
-            Toggle("Muse 悬浮栏语音上屏", if (museOverlayInsert) "悬浮栏上屏；聊天里的语音输入不受影响。不自动听、不自动发送，发送由小布模块点绿箭头" else "已关闭，在 Muse 里恢复成普通输入框语音输入", museOverlayInsert) {
+            Toggle("Muse 悬浮栏语音上屏", if (museOverlayInsert) "悬浮栏搜索框自动听、上屏；发送由小布模块点绿箭头；聊天里的语音输入不受影响" else "已关闭，在 Muse 里恢复成普通输入框语音输入", museOverlayInsert) {
                 museOverlayInsert = it
                 p.museOverlayInsert = it
             }

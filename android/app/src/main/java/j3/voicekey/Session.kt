@@ -51,6 +51,8 @@ class Session(private val svc: VoiceService) {
     /** 1.13.3 悬浮栏上屏：本次会话的目标是 Muse 悬浮栏搜索框，结束只上屏、不发送；手动会话在别处恒为 false */
     var overlayFlow = false
         private set
+    /** 本次会话是悬浮栏自动触发开始的（结束时抑制下一次自动触发）；手动会话恒为 false */
+    private var overlayAuto = false
     val active get() = rows.isNotEmpty()
     val recording get() = recorder != null
 
@@ -69,6 +71,14 @@ class Session(private val svc: VoiceService) {
 
     fun holdStart() {
         if (!active) begin(false)
+    }
+
+    /** 悬浮栏自动触发：不在会话中才按自动停止（静音自动结束）开始一次；返回是否真的开始了 */
+    fun autoStartOverlay(): Boolean {
+        if (active || recording) return false
+        begin(true)
+        overlayAuto = active
+        return active
     }
 
     fun holdEnd() {
@@ -415,6 +425,9 @@ class Session(private val svc: VoiceService) {
     private fun close() {
         cancelPickGrace()
         gen++
+        // 悬浮栏自动触发的会话结束：抑制再触发，直到框失焦或悬浮栏关掉再重新聚焦
+        if (overlayAuto) svc.suppressOverlayAuto()
+        overlayAuto = false
         overlayFlow = false
         recorder?.stop()
         recorder = null

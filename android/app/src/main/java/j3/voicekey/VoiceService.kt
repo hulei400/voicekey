@@ -27,6 +27,8 @@ class VoiceService : AccessibilityService() {
     private val check = Runnable { refresh() }
     private var chordKeys = App.prefs.holdKeys
     private var chord = Chord(chordKeys)
+    /** 1.13.4 悬浮栏自动触发：自动会话结束后抑制再触发，直到框失焦或悬浮栏关掉再重新聚焦 */
+    private var overlayAutoSuppressed = false
 
     /** 设置页录制长按组合：非空时接管按键，录完回调结果；null 表示取消 */
     var recorder: ((List<Int>?) -> Unit)? = null
@@ -51,6 +53,45 @@ class VoiceService : AccessibilityService() {
     override fun onAccessibilityEvent(e: AccessibilityEvent) {
         main.removeCallbacks(check)
         main.postDelayed(check, 150)
+        maybeAutoListenOverlay(e)
+    }
+
+    /**
+     * 1.13.4 悬浮栏自动触发：只限 Muse 悬浮栏搜索框。聚焦或窗口切换时，如果当前聚焦框
+     * 是悬浮栏搜索框（IME 动作 SEARCH，或提示含“搜索”），且框里没字、没在会话中，就自动开始听，
+     * 说完自动上屏进这个框，不用按音量键、不用点悬浮球。聊天输入框是 SEND 动作，永不自动触发；
+     * 聊天里只手动。框里已有用户自己打的字时不触发；自动会话结束后抑制再触发，直到框失焦
+     * 或悬浮栏关掉再重新聚焦。开关 museOverlayInsert 关着时不自动触发。
+     * 注意：只负责自动开始听，不负责给框聚焦——点搜索框聚焦由小布模块做。
+     */
+    private fun maybeAutoListenOverlay(e: AccessibilityEvent) {
+        if (!App.prefs.museOverlayInsert || !::session.isInitialized) return
+        if (e.eventType != AccessibilityEvent.TYPE_VIEW_FOCUSED &&
+            e.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+        ) return
+        val pkg = e.packageName?.toString() ?: rootInActiveWindow?.packageName?.toString()
+        if (pkg != MUSE_PKG) {
+            if (e.packageName != null) overlayAutoSuppressed = false
+            return
+        }
+        if (session.active || session.recording) return
+        val input = focusedInput()
+        if (input == null) {
+            // 失焦 / 悬浮栏关掉：解除抑制，等下次重新聚焦
+            overlayAutoSuppressed = false
+            return
+        }
+        if (overlayAutoSuppressed) return
+        // 明确限制：聊天输入框（IME 动作 SEND）永不自动触发
+        if (focusedEditorAction() == EditorInfo.IME_ACTION_SEND) return
+        if (!nodeTextEmpty(input)) return
+        if (!isMuseOverlaySearchBox(input)) return
+        session.autoStartOverlay()
+    }
+
+    /** 自动触发的会话结束（上屏/失败/超时）后抑制再触发，直到框失焦或悬浮栏关掉 */
+    fun suppressOverlayAuto() {
+        overlayAutoSuppressed = true
     }
 
     override fun onInterrupt() {}
