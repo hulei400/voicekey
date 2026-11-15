@@ -47,6 +47,33 @@ class Session(private val svc: VoiceService) {
     private var manual = false
     /** 1.13.6 悬浮栏自动触发“稳定 partial 先上屏”的定时器；close() 时取消 */
     private var partialRun: Runnable? = null
+    /** 1.13.7 文件日志：logcat 缓冲会轮转，关键诊断改写文件（VoiceKey files 目录的 vk-session-trace.log） */
+    private var sessionStartElapsed = 0L
+    /** 1.13.7：上次音量超过 0.3 的时间（用户确实在说话）；PARTIAL 刷新 lastVoice 只认这个 */
+    private var lastLoudMs: Long = 0L
+    /** 1.13.7：lastVoice 上次是被谁刷新的（vol=音量，part=文字变化），诊断“还在听”用 */
+    private var lastVoiceSrc = ""
+    /** 1.13.7：上次 level() 回调音量是否超过 0.3（记 loud→quiet 过渡用） */
+    private var wasLoud = false
+    /** 1.13.7：音量已经落了之后、PARTIAL 还刷新 lastVoice 的次数（“还在听”的直接证据） */
+    private var partRefreshAfterQuiet = 0
+
+    /** 1.13.7 文件日志：每行带墙钟时间 + 本次会话开始后的毫秒，只记文字长度和前几个字，不记整句 */
+    private fun logf(tag: String, msg: String) {
+        try {
+            val f = java.io.File(svc.filesDir, "vk-session-trace.log")
+            if (f.exists() && f.length() > 512 * 1024) f.delete()
+            val now = System.currentTimeMillis()
+            val wall = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US).format(java.util.Date(now))
+            val dt = SystemClock.elapsedRealtime() - sessionStartElapsed
+            f.appendText("$wall dt=$dt [$tag] $msg\n")
+        } catch (_: Exception) {
+        }
+    }
+
+    /** 1.13.7：文字只记长度 + 前 4 个字，不把用户说的整句写进日志 */
+    private fun shortText(t: String): String =
+        if (t.length <= 4) "\"$t\" len=${t.length}" else "\"${t.take(4)}…\" len=${t.length}"
 
     var rows: List<Row> = emptyList()
         private set
@@ -89,6 +116,7 @@ class Session(private val svc: VoiceService) {
         if (active || recording) return false
         begin(true)
         overlayAuto = active
+        logf("AUTO", "autoStartOverlay active=$active overlayAuto=$overlayAuto")
         return active
     }
 
@@ -97,6 +125,11 @@ class Session(private val svc: VoiceService) {
     }
 
     private fun begin(auto: Boolean) {
+        sessionStartElapsed = SystemClock.elapsedRealtime()
+        lastLoudMs = 0L
+        lastVoiceSrc = ""
+        wasLoud = false
+        partRefreshAfterQuiet = 0
         val chs = channels()
         val ready = chs.filter { it.ready && it.loggedIn }
         if (ready.isEmpty()) {
@@ -149,6 +182,8 @@ class Session(private val svc: VoiceService) {
         autoStop = auto
         heard = false
         lastVoice = SystemClock.elapsedRealtime()
+        lastVoiceSrc = "init"
+        logf("BEGIN", "auto=$auto autoStop=$autoStop overlayFlow=$overlayFlow picking=$picking rows=${rows.size} silence=${App.prefs.silence} silenceStop=${App.prefs.silenceStop}")
         svc.onSessionChanged()
     }
 
@@ -159,8 +194,20 @@ class Session(private val svc: VoiceService) {
         if (v > 0.3f) {
             heard = true
             lastVoice = now
-        } else if (now - lastVoice > if (heard) (App.prefs.silence * 1000).toLong() else 8000L) {
-            end()
+            lastLoudMs = now
+            lastVoiceSrc = "vol"
+            if (!wasLoud) {
+                wasLoud = true
+                logf("VOL", "loud v=${(v * 100).toInt()}")
+            }
+        } else {
+            if (wasLoud) {
+                wasLoud = false
+                logf("VOL", "quiet v=${(v * 100).toInt()} lastVoiceAge=${now - lastVoice} lastLoudAge=${now - lastLoudMs}")
+            }
+            if (now - lastVoice > if (heard) (App.prefs.silence * 1000).toLong() else 8000L) {
+                end()
+            }
         }
     }
 
@@ -182,7 +229,17 @@ class Session(private val svc: VoiceService) {
         if (picking) advancePick()
         // 1.13.6 悬浮栏自动触发：停录后不等 Final（双通道二次识别慢），
         // 用已稳定的流式整句先上屏；手动会话、手动点选不走这条
-        if (overlayAuto && overlayFlow && !choosePending && !manual) schedulePartialCheck()
+        val timer = if (overlayAuto && overlayFlow && !choosePending && !manual) schedulePartialCheck() else false
+        // 1.13.7：聆听总时长、静音超时、lastVoice 最后是谁刷新的、音量落了之后 PARTIAL 还刷了几次
+        val nowEnd = SystemClock.elapsedRealtime()
+        logf(
+            "END",
+            "listenMs=${nowEnd - sessionStartElapsed} silence=${App.prefs.silence} silenceStop=${App.prefs.silenceStop} " +
+                "heard=$heard lastVoiceSrc=$lastVoiceSrc lastVoiceAge=${nowEnd - lastVoice} " +
+                "lastLoudAge=${if (lastLoudMs == 0L) -1 else nowEnd - lastLoudMs} " +
+                "partRefreshAfterQuiet=$partRefreshAfterQuiet " +
+                "overlayAuto=$overlayAuto overlayFlow=$overlayFlow choosePending=$choosePending manual=$manual timerScheduled=$timer"
+        )
         svc.onSessionChanged()
     }
 
@@ -191,10 +248,19 @@ class Session(private val svc: VoiceService) {
         when (kind) {
             Native.RECONNECT -> return svc.hud.info(text)
             Native.PARTIAL -> {
-                // 识别文字仍在变化即视为在说话，避免声音小时被静音判定中途截断
+                // 1.13.7：文字变化只在最近 500ms 内音量曾经够大（用户确实在说话）时才刷新 lastVoice；
+                // 否则（用户已经说完、音量落了，只剩服务端流式修正）不刷新，避免修正拖着不让停录。
+                // 整场都没听到过够大的音量（小声说话）时仍刷新，避免把小声说话中途截断。
                 if (recording && text != row.text) {
                     heard = true
-                    lastVoice = SystemClock.elapsedRealtime()
+                    val nowPart = SystemClock.elapsedRealtime()
+                    val gated = lastLoudMs != 0L && nowPart - lastLoudMs > 500
+                    if (!gated) {
+                        lastVoice = nowPart
+                        lastVoiceSrc = "part"
+                        if (!wasLoud) partRefreshAfterQuiet++
+                    }
+                    logf("PART", "ch=${row.ch.short} ${shortText(text)} refreshLastVoice=${!gated} gated=$gated wasLoud=$wasLoud lastLoudAge=${if (lastLoudMs == 0L) -1 else nowPart - lastLoudMs}")
                 }
                 setRowText(row, text)
                 if (typer?.update(text) == true) typed = true
@@ -247,6 +313,7 @@ class Session(private val svc: VoiceService) {
         // 用户已动手（点选/换行/待选）或还在录音时不抢，避免打断说话和手动选择
         if (overlayFlow && !manual && !choosePending && !recording) {
             rows.indexOfFirst { it.state == State.Final }.takeIf { it >= 0 }?.let {
+                logf("FINAL", "Final 路上屏 row=$it ch=${rows[it].ch.short} ${shortText(rows[it].text)}")
                 choose(it, false)
                 return
             }
@@ -310,14 +377,21 @@ class Session(private val svc: VoiceService) {
      * 只在自动触发的悬浮栏会话里跑（overlayAuto），手动触发、手动点选都不受影响；
      * 找不到稳定文字时什么都不做，Final 那条快路（advancePick）仍是后备。
      */
-    private fun schedulePartialCheck() {
-        if (!active || !overlayAuto || !overlayFlow || manual || choosePending || recording) return
+    private fun schedulePartialCheck(): Boolean {
+        if (!active || !overlayAuto || !overlayFlow || manual || choosePending || recording) {
+            logf("TIMER", "not scheduled active=$active overlayAuto=$overlayAuto overlayFlow=$overlayFlow manual=$manual choosePending=$choosePending recording=$recording")
+            return false
+        }
         cancelPartialCheck()
         val g = gen
         val run = object : Runnable {
             override fun run() {
-                if (g != gen) return
+                if (g != gen) {
+                    logf("TIMER", "run skipped gen changed g=$g gen=$gen")
+                    return
+                }
                 partialRun = null
+                logf("TIMER", "run rows=" + rows.joinToString(",") { "${it.ch.short}:${it.state}:len${it.text.length}:stable${SystemClock.elapsedRealtime() - it.lastTextMs}" })
                 if (commitFirstStablePartial()) return
                 // 还没有可上屏的稳定文字：只要还有路在识别，就再等一轮看看；
                 // Final 到了会走快路、会话结束（close）会清掉这个定时器
@@ -325,11 +399,15 @@ class Session(private val svc: VoiceService) {
                     rows.any { it.state == State.Listen || it.state == State.Wait }) {
                     partialRun = this
                     main.postDelayed(this, PARTIAL_RECHECK_MS)
+                } else {
+                    logf("TIMER", "stop no rows in Listen/Wait")
                 }
             }
         }
         partialRun = run
         main.postDelayed(run, PARTIAL_SETTLE_MS)
+        logf("TIMER", "scheduled settleMs=$PARTIAL_SETTLE_MS")
+        return true
     }
 
     /**
@@ -339,22 +417,33 @@ class Session(private val svc: VoiceService) {
      * 返回是否真的上屏了。
      */
     private fun commitFirstStablePartial(): Boolean {
-        if (!active || !overlayAuto || !overlayFlow || manual || choosePending || recording) return false
+        if (!active || !overlayAuto || !overlayFlow || manual || choosePending || recording) {
+            logf("PCOMMIT", "guard fail active=$active overlayAuto=$overlayAuto overlayFlow=$overlayFlow manual=$manual choosePending=$choosePending recording=$recording")
+            return false
+        }
         val now = SystemClock.elapsedRealtime()
         // 至少等 PARTIAL_SETTLE_MS，让停录前后飞行中的 partial 落定
-        if (now - releasedAt < PARTIAL_SETTLE_MS) return false
+        if (now - releasedAt < PARTIAL_SETTLE_MS) {
+            logf("PCOMMIT", "too early sinceEndMs=${now - releasedAt}")
+            return false
+        }
         val idx = rows.indexOfFirst { r ->
             r.state != State.Error && r.text.isNotEmpty() &&
                 now - r.lastTextMs >= PARTIAL_STABLE_MS
         }
-        if (idx < 0) return false
+        if (idx < 0) {
+            logf("PCOMMIT", "no stable row rows=" + rows.joinToString(",") { "${it.ch.short}:${it.state}:len${it.text.length}:stable${now - it.lastTextMs}" })
+            return false
+        }
         val row = rows[idx]
         val node = target
         val text = row.text
+        logf("PCOMMIT", "found row=$idx ch=${row.ch.short} ${shortText(text)} stableMs=${now - row.lastTextMs}")
         App.prefs.lastPick = row.ch
         if (picking) App.prefs.countPick(row.ch)
         close()
-        insertForOverlay(node, text)
+        val ok = insertForOverlay(node, text)
+        logf("PCOMMIT", "committed row=$idx ok=$ok")
         return true
     }
 
@@ -429,9 +518,12 @@ class Session(private val svc: VoiceService) {
         val n = node?.takeIf { it.refresh() }
         if (n != null && !svc.nodeTextEmpty(n)) {
             svc.hud.info("搜索框里已有文字，未写入")
+            logf("INSERT", "blocked box has user text ${shortText(text)}")
             return false
         }
-        return Inject.insert(svc, n, text)
+        val ok = Inject.insert(svc, n, text)
+        logf("INSERT", "ok=$ok ${shortText(text)}")
+        return ok
     }
 
     private fun single(row: Row) {
@@ -506,7 +598,19 @@ class Session(private val svc: VoiceService) {
         }
     }
 
+    /** 1.13.7：从调用栈里找是哪个 Session 方法调的 close（定时器还是 Final 路），诊断用 */
+    private fun closeCaller(): String {
+        for (e in Thread.currentThread().stackTrace) {
+            if (e.className.contains("Session") && e.methodName != "close" &&
+                e.methodName != "closeCaller" &&
+                e.methodName != "cancelPartialCheck" && e.methodName != "cancelPickGrace"
+            ) return e.methodName
+        }
+        return "?"
+    }
+
     private fun close() {
+        logf("CLOSE", "caller=${closeCaller()} gen=$gen overlayAuto=$overlayAuto overlayFlow=$overlayFlow")
         cancelPickGrace()
         cancelPartialCheck()
         gen++
