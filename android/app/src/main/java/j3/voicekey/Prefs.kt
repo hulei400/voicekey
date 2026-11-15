@@ -108,10 +108,10 @@ class Prefs(ctx: Context) {
         get() = if (sp.contains("pickSend")) sp.getBoolean("pickSend", false) else sp.getBoolean("jevSend", false)
         set(v) = sp.edit().putBoolean("pickSend", v).apply()
 
-    /** 小布全自动（只在 Muse 里）：输入框聚焦就自动听，说完自动上屏并发送；默认开，手动流程不受影响 */
-    var autoMuseFlow: Boolean
-        get() = sp.getBoolean("autoMuseFlow", true)
-        set(v) = sp.edit().putBoolean("autoMuseFlow", v).apply()
+    /** Muse 悬浮栏语音上屏（只在 Muse 里）：手动触发说话后，把识别结果写进悬浮栏的搜索框；不自动听、不自动发送，发送由小布模块点绿箭头。默认开；关掉则在 Muse 里恢复成普通输入框语音输入 */
+    var museOverlayInsert: Boolean
+        get() = sp.getBoolean("museOverlayInsert", true)
+        set(v) = sp.edit().putBoolean("museOverlayInsert", v).apply()
 
     /** 上次自动检查更新的时间（毫秒），用于 12 小时节流 */
     var updateCheckedAt: Long

@@ -130,7 +130,7 @@ private fun Screen(tick: Int, refresh: () -> Unit) {
     var multi by remember { mutableStateOf(p.multi.toSet()) }
     var streaming by remember { mutableStateOf(p.streaming) }
     var pickSend by remember { mutableStateOf(p.pickSend) }
-    var autoMuseFlow by remember { mutableStateOf(p.autoMuseFlow) }
+    var museOverlayInsert by remember { mutableStateOf(p.museOverlayInsert) }
     var silence by remember { mutableFloatStateOf(p.silence) }
     var silenceStop by remember { mutableStateOf(p.silenceStop) }
     var volumeKey by remember { mutableStateOf(p.volumeKey) }
@@ -242,9 +242,9 @@ private fun Screen(tick: Int, refresh: () -> Unit) {
         }
 
         Section("说话方式") {
-            Toggle("Muse 全自动发送", if (autoMuseFlow) "在 Muse 里点开输入框就自动听，说完自动上屏并发送；只在 Muse 里生效" else "已关闭，只手动说话", autoMuseFlow) {
-                autoMuseFlow = it
-                p.autoMuseFlow = it
+            Toggle("Muse 悬浮栏语音上屏", if (museOverlayInsert) "在 Muse 里手动说话后，把识别结果写进悬浮栏的搜索框；不自动听、不自动发送，发送由小布模块点绿箭头" else "已关闭，在 Muse 里恢复成普通输入框语音输入", museOverlayInsert) {
+                museOverlayInsert = it
+                p.museOverlayInsert = it
             }
             val volumeOnly = p.holdKeys.all { it in Keys.volume }
             Toggle("长按${holdName}说话", "仅在输入框聚焦时生效" + if (volumeOnly) "，短按仍调音量" else "", volumeKey) {

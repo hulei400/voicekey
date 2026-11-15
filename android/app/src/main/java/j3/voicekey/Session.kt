@@ -48,8 +48,8 @@ class Session(private val svc: VoiceService) {
         private set
     var picking = false
         private set
-    /** 小布全自动：本次会话由 Muse 输入框聚焦触发，结束自动上屏并发送；手动开始的会话恒为 false */
-    var autoFlow = false
+    /** 1.13.3 悬浮栏上屏：本次会话的目标是 Muse 悬浮栏搜索框，结束只上屏、不发送；手动会话在别处恒为 false */
+    var overlayFlow = false
         private set
     val active get() = rows.isNotEmpty()
     val recording get() = recorder != null
@@ -58,14 +58,6 @@ class Session(private val svc: VoiceService) {
 
     fun prewarm() {
         if (!active) channels().filter { it.ready && it.loggedIn }.forEach { Native.prewarm(it.id) }
-    }
-
-    /** 小布全自动：Muse 输入框聚焦时自动开始，走现有的点按路径（静音自动结束）。开始失败则不留自动标记 */
-    fun beginAuto() {
-        if (active || recording) return
-        autoFlow = true
-        tap()
-        if (!active && !recording) autoFlow = false
     }
 
     /** 点按：没在说就开始（静音自动结束），在录就结束，候选框开着就取消 */
@@ -95,6 +87,21 @@ class Session(private val svc: VoiceService) {
         val g = ++gen
         selectionTiming = App.prefs.jevSelectionTiming()
         target = svc.focusedInput()
+        // 1.13.3 悬浮栏上屏（开关开着、且当前在 Muse 里）：目标只限悬浮栏搜索框。
+        // 不是搜索框（例如聊天界面输入框）就不开始；框里已有用户自己打的字也不开始、不覆盖。
+        overlayFlow = false
+        if (App.prefs.museOverlayInsert && svc.isMuseForeground()) {
+            val box = target?.takeIf { svc.isMuseOverlaySearchBox(it) }
+            if (box == null) {
+                svc.hud.info("请先点开 Muse 悬浮栏的搜索框")
+                return
+            }
+            if (!svc.nodeTextEmpty(box)) {
+                svc.hud.info("搜索框里已有文字，未写入")
+                return
+            }
+            overlayFlow = true
+        }
         rows = (if (ready.size > 1) ready.sortedByDescending { App.prefs.pickCount(it) } else ready).map { Row(it) }
         picking = rows.size > 1
         userPicked = false
@@ -114,7 +121,8 @@ class Session(private val svc: VoiceService) {
                 r.text = "渠道不可用"
             }
         }
-        typer = if (!picking && App.prefs.streaming) target?.let(::Typer) else null
+        // 悬浮栏上屏不做边说边写：录完只以定稿一次性写入，避免中途文字干扰搜索框
+        typer = if (!picking && App.prefs.streaming && !overlayFlow) target?.let(::Typer) else null
         typed = false
         val handles = rows.map { it.handle }.filter { it != 0L }.toLongArray()
         recorder = try {
@@ -220,11 +228,11 @@ class Session(private val svc: VoiceService) {
      */
     private fun advancePick() {
         if (!picking) return
-        // 小布全自动：不等用户按数字键选，有了第一条定稿就按列表顺序取最靠前的一条上屏并发送；
+        // 悬浮栏上屏：不等用户按数字键选，有了第一条定稿就按列表顺序取最靠前的一条上屏（只上屏、不发送）；
         // 用户已动手（点选/换行/待选）或还在录音时不抢，避免打断说话和手动选择
-        if (autoFlow && !manual && !choosePending && !recording) {
+        if (overlayFlow && !manual && !choosePending && !recording) {
             rows.indexOfFirst { it.state == State.Final }.takeIf { it >= 0 }?.let {
-                choose(it, true)
+                choose(it, false)
                 return
             }
         }
@@ -331,22 +339,29 @@ class Session(private val svc: VoiceService) {
         }
     }
 
+    /** 悬浮栏上屏：上屏前再核一次框里有没有用户自己打的字，有就不写 */
+    private fun insertForOverlay(node: AccessibilityNodeInfo?, text: String): Boolean {
+        val n = node?.takeIf { it.refresh() }
+        if (n != null && !svc.nodeTextEmpty(n)) {
+            svc.hud.info("搜索框里已有文字，未写入")
+            return false
+        }
+        return Inject.insert(svc, n, text)
+    }
+
     private fun single(row: Row) {
         val t = typer
         val node = target
-        val auto = autoFlow
+        val overlay = overlayFlow
         close()
         when {
             row.state == State.Final -> {
-                val ok = if (t?.update(row.text) != true) Inject.insert(svc, node, row.text) else true
-                if (auto) {
-                    // 自动流程：上屏成功且文字非空才发送；上屏失败只留字不崩溃，抑制到下一次失焦再聚焦
-                    if (ok && row.text.isNotEmpty()) svc.autoSend(node) else svc.suppressAutoFlow()
-                }
+                // 悬浮栏上屏只写字不发送；其余情况走原来的手动上屏路径
+                if (overlay) insertForOverlay(node, row.text)
+                else if (t?.update(row.text) != true) Inject.insert(svc, node, row.text)
             }
             typed -> {}
-            // 自动流程里没识别到内容不弹错：用户本来就没想说话，只是打开了聊天框
-            else -> if (auto) svc.suppressAutoFlow() else svc.hud.error(if (row.text == "没有识别到内容") row.text else "识别失败：${row.text}")
+            else -> svc.hud.error(if (row.text == "没有识别到内容") row.text else "识别失败：${row.text}")
         }
     }
 
@@ -367,14 +382,11 @@ class Session(private val svc: VoiceService) {
                 App.prefs.lastPick = r.ch
                 if (picking) App.prefs.countPick(r.ch)
                 val node = target
-                val auto = autoFlow
+                val overlay = overlayFlow
                 close()
-                val ok = Inject.insert(svc, node, r.text)
-                if (ok && send) {
-                    if (auto) svc.autoSend(node) else svc.send(node)
-                } else if (auto) {
-                    svc.suppressAutoFlow()
-                }
+                // 悬浮栏上屏只写字，发送一律交给小布模块点绿箭头；其余情况 send 为真才点发送
+                val ok = if (overlay) insertForOverlay(node, r.text) else Inject.insert(svc, node, r.text)
+                if (ok && send && !overlay) svc.send(node)
             }
             State.Error -> svc.onSessionChanged()
         }
@@ -398,11 +410,11 @@ class Session(private val svc: VoiceService) {
         val t = typer
         val node = target
         val already = typed
-        val auto = autoFlow
+        val overlay = overlayFlow
         close()
-        if (auto && keep == null) svc.suppressAutoFlow()
         if (keep != null) {
-            if (t?.update(keep) != true && !already) Inject.insert(svc, node, keep)
+            if (overlay) insertForOverlay(node, keep)
+            else if (t?.update(keep) != true && !already) Inject.insert(svc, node, keep)
             svc.hud.info("$message，已保留已识别的文字")
         } else {
             message?.let(svc.hud::error)
@@ -412,7 +424,7 @@ class Session(private val svc: VoiceService) {
     private fun close() {
         cancelPickGrace()
         gen++
-        autoFlow = false
+        overlayFlow = false
         recorder?.stop()
         recorder = null
         for (r in rows) {

@@ -27,8 +27,6 @@ class VoiceService : AccessibilityService() {
     private val check = Runnable { refresh() }
     private var chordKeys = App.prefs.holdKeys
     private var chord = Chord(chordKeys)
-    /** 小布全自动：发完一次后抑制，直到输入框失焦再重新聚焦才允许下一次自动触发 */
-    private var autoSuppressed = false
 
     /** 设置页录制长按组合：非空时接管按键，录完回调结果；null 表示取消 */
     var recorder: ((List<Int>?) -> Unit)? = null
@@ -53,68 +51,6 @@ class VoiceService : AccessibilityService() {
     override fun onAccessibilityEvent(e: AccessibilityEvent) {
         main.removeCallbacks(check)
         main.postDelayed(check, 150)
-        maybeAutoListen(e)
-    }
-
-    /**
-     * 小布全自动触发点：只在 Muse（com.facebook.aura）里触发，别的应用的输入框绝不自动听。
-     * 聚焦或窗口切换时：已有可编辑输入框就直接听；还没聚焦就先让它聚焦（不行再点一下），
-     * 点后的聚焦事件会再进来一次。框里已有用户自己打的字时不自动听，避免追加到半句话后面。
-     */
-    private fun maybeAutoListen(e: AccessibilityEvent) {
-        if (!App.prefs.autoMuseFlow || !::session.isInitialized) return
-        if (e.eventType != AccessibilityEvent.TYPE_VIEW_FOCUSED &&
-            e.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
-        ) return
-        val pkg = e.packageName?.toString() ?: rootInActiveWindow?.packageName?.toString()
-        if (pkg != MUSE_PKG) {
-            if (e.packageName != null) autoSuppressed = false
-            return
-        }
-        if (session.active || session.recording) return
-        val input = focusedInput()
-        if (input == null) {
-            // 失焦了：解除抑制，等下次重新聚焦；顺便找框聚焦（点后的聚焦事件会再进来）
-            autoSuppressed = false
-            rootInActiveWindow?.let { findEditable(it) }?.let { node ->
-                if (!node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)) {
-                    node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                }
-            }
-            return
-        }
-        if (autoSuppressed) return
-        val txt = input.text?.toString().orEmpty()
-        if (txt.isNotEmpty() && !input.isShowingHintText) return
-        session.beginAuto()
-    }
-
-    /** 窗口树里找第一个可见的可编辑节点（只找，不写） */
-    private fun findEditable(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        val stack = ArrayDeque<AccessibilityNodeInfo>()
-        stack.add(root)
-        var seen = 0
-        while (stack.isNotEmpty() && seen < 300) {
-            val n = stack.removeLast()
-            seen++
-            if (n.isEditable && n.isVisibleToUser) return n
-            for (i in 0 until n.childCount) n.getChild(i)?.let { stack.add(it) }
-        }
-        return null
-    }
-
-    /**
-     * 小布全自动：上屏成功后等界面稳定一下（500ms，send 内部首试还有约 450ms，共约 1 秒）
-     * 再点发送；同时抑制下一次自动触发，直到输入框失焦再重新聚焦。
-     */
-    fun autoSend(node: AccessibilityNodeInfo?) {
-        autoSuppressed = true
-        main.postDelayed({ send(node) }, 500)
-    }
-
-    /** 自动流程结束且无有效上屏（没听清/上屏失败/超时）：抑制到下一次失焦再聚焦，避免反复自动听 */
-    fun suppressAutoFlow() {
-        autoSuppressed = true
     }
 
     override fun onInterrupt() {}
@@ -131,6 +67,50 @@ class VoiceService : AccessibilityService() {
     }
 
     fun focusedInput(): AccessibilityNodeInfo? = findFocus(AccessibilityNodeInfo.FOCUS_INPUT)?.takeIf { it.isEditable }
+
+    /** 当前活动窗口的包名（用于判断是不是在 Muse 里） */
+    fun foregroundPackage(): String? = rootInActiveWindow?.packageName?.toString()
+
+    fun isMuseForeground(): Boolean = foregroundPackage() == MUSE_PKG
+
+    /**
+     * Muse 悬浮栏搜索框识别（与聊天界面的输入框区分，1.13.3 唯一的上屏目标）。
+     *
+     * 两个包都叫 com.facebook.aura、窗口结构也无法从代码上可靠区分，所以不用窗口特征，
+     * 只用输入框自身的信号，主信号是输入法侧的动作：
+     * ① 当前聚焦编辑框的 IME 动作是“搜索”（IME_ACTION_SEARCH）——搜索框的典型动作，
+     *    聊天输入框的动作一般是“发送”，不会命中；
+     * ② 提示文字/内容描述含“搜索”/“Search”（备用信号）。
+     * 两个信号都没命中就返回 false（宁可不上屏，也不写进聊天输入框）。
+     * 注意：这两个信号都未在真机悬浮栏上核对过——如果悬浮栏搜索框的 IME 动作不是
+     * SEARCH 且提示文字也不含“搜索”，1.13.3 会拒绝上屏，届时按日志里的 imeAction/hint 再调。
+     */
+    fun isMuseOverlaySearchBox(node: AccessibilityNodeInfo): Boolean {
+        if (!node.isEditable || !node.isVisibleToUser) return false
+        val action = focusedEditorAction()
+        Log.d(TAG, "muse overlay check: imeAction=$action hint=${node.hintText} desc=${node.contentDescription} showingHint=${node.isShowingHintText}")
+        if (action == EditorInfo.IME_ACTION_SEARCH) return true
+        val hints = listOfNotNull(
+            node.hintText?.toString(),
+            node.contentDescription?.toString(),
+            node.text?.toString().takeIf { node.isShowingHintText },
+        )
+        return hints.any { h -> SEARCH_HINTS.any { w -> h.contains(w, ignoreCase = true) } }
+    }
+
+    /** 当前聚焦的编辑框在输入法侧的动作；未聚焦或无输入连接时返回 -1 */
+    private fun focusedEditorAction(): Int {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return -1
+        val im = inputMethod ?: return -1
+        if (!im.currentInputStarted) return -1
+        return (im.currentInputEditorInfo?.imeOptions ?: 0) and EditorInfo.IME_MASK_ACTION
+    }
+
+    /** 框里是否没有用户自己打的字（空框、只显示占位提示，或输入连接里的正文为空） */
+    fun nodeTextEmpty(node: AccessibilityNodeInfo): Boolean {
+        val raw = node.text?.toString().orEmpty()
+        return raw.isEmpty() || node.isShowingHintText || raw == node.hintText?.toString() || editorEmpty()
+    }
 
     /** 微信等会对无障碍隐藏控件树，拿不到输入框时以键盘是否弹出为准 */
     fun typing(): Boolean = focusedInput() != null || windows.any { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
@@ -159,7 +139,7 @@ class VoiceService : AccessibilityService() {
                 clickSend(node) -> {}
                 tries > 1 -> send(node, tries - 1)
                 !editorSend() -> {
-                    Log.w(TAG, "autoSend: send button not found, text kept in editor")
+                    Log.w(TAG, "send: send button not found, text kept in editor")
                     hud.info("没找到发送按钮，已上屏")
                 }
             }
@@ -337,9 +317,10 @@ class VoiceService : AccessibilityService() {
         var instance: VoiceService? = null
             private set
         private const val TAG = "VoiceKey"
-        /** 小布全自动只在 Muse 里触发 */
+        /** Muse 包名：悬浮栏搜索框与聊天输入框同属此包，区分靠 isMuseOverlaySearchBox 的框内信号 */
         private const val MUSE_PKG = "com.facebook.aura"
         private val SEND = listOf("发送", "Send")
+        private val SEARCH_HINTS = listOf("搜索", "搜", "Search")
         private val ACTIONS = setOf(EditorInfo.IME_ACTION_SEND, EditorInfo.IME_ACTION_GO, EditorInfo.IME_ACTION_SEARCH, EditorInfo.IME_ACTION_DONE)
 
         fun enabled(ctx: Context): Boolean {
